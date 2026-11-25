@@ -258,3 +258,10 @@ CREATE POLICY "audit_logs_select" ON public.audit_logs
 -- Deleted Business Archives: yalnızca admin
 CREATE POLICY "deleted_archives_admin_only" ON public.deleted_business_archives
   FOR ALL USING (public.is_system_admin()) WITH CHECK (public.is_system_admin());
+
+-- Supabase API Rolleri için Şema ve Tablo Erişim İzinleri (42501 hatasını önler)
+GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO postgres, anon, authenticated, service_role;
+

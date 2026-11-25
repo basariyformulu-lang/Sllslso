@@ -1007,3 +1007,10 @@ INSERT INTO public.permissions (code, module, action, label_tr) VALUES
   ('recurring.pay', 'Sabit Giderler', 'pay', 'Sabit gider ödeme kaydetme'),
   ('users.manage', 'Kullanıcılar', 'manage', 'İşletme kullanıcı ve yetki yönetimi')
 ON CONFLICT (code) DO NOTHING;
+
+-- Supabase API Rolleri için Şema ve Tablo Erişim İzinleri (42501 hatasını önler)
+GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO postgres, anon, authenticated, service_role;
+

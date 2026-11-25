@@ -20,6 +20,7 @@ import {
   ExternalLink,
   RefreshCw,
   Database,
+  KeyRound,
 } from 'lucide-react';
 import { createBrowserSupabase } from '@/lib/supabase/client';
 import { useToast } from '@/components/ToastProvider';
@@ -41,14 +42,23 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
   const { showToast } = useToast();
 
   const [state, setState] = useState<
-    'loading' | 'unconfigured' | 'needs_schema' | 'needs_bootstrap' | 'unauthorized' | 'ready'
+    | 'loading'
+    | 'unconfigured'
+    | 'needs_schema'
+    | 'needs_grants'
+    | 'needs_bootstrap'
+    | 'unauthorized'
+    | 'ready'
   >('loading');
   const [adminName, setAdminName] = useState('');
   const [adminEmail, setAdminEmail] = useState('');
   const [requiresSecret, setRequiresSecret] = useState(false);
   const [projectRef, setProjectRef] = useState<string | null>(null);
   const [sqlScript, setSqlScript] = useState('');
+  const [grantSql, setGrantSql] = useState('');
   const [sqlCopied, setSqlCopied] = useState(false);
+  const [accessToken, setAccessToken] = useState('');
+  const [autoSettingUp, setAutoSettingUp] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const [bootForm, setBootForm] = useState({
@@ -77,6 +87,13 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
         setProjectRef(bootData.projectRef || null);
         setSqlScript(bootData.sqlScript || '');
         setState('needs_schema');
+        return;
+      }
+
+      if (bootData.permissionsReady === false) {
+        setProjectRef(bootData.projectRef || null);
+        setGrantSql(bootData.grantSql || '');
+        setState('needs_grants');
         return;
       }
 
@@ -168,83 +185,169 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
     );
   }
 
-  if (state === 'needs_schema') {
+  if (state === 'needs_schema' || state === 'needs_grants') {
+    const isGrantsOnly = state === 'needs_grants';
+    const activeSql = isGrantsOnly ? grantSql : sqlScript;
     const sqlEditorUrl = projectRef
       ? `https://supabase.com/dashboard/project/${projectRef}/sql/new`
       : 'https://supabase.com/dashboard';
 
     async function handleCopySql() {
-      if (!sqlScript) return;
+      if (!activeSql) return;
       try {
-        await navigator.clipboard.writeText(sqlScript);
+        await navigator.clipboard.writeText(activeSql);
         setSqlCopied(true);
-        showToast('Kurulum SQL kodu kopyalandı', 'success', 'Supabase SQL Editor içine yapıştırıp Run butonuna basınız.');
+        showToast(
+          isGrantsOnly ? '4 satırlık izin kodu kopyalandı' : 'Kurulum SQL kodu kopyalandı',
+          'success',
+          'Supabase SQL Editor içine yapıştırıp Run butonuna basınız.'
+        );
         setTimeout(() => setSqlCopied(false), 3000);
       } catch {
         showToast('Kopyalama için aşağıdaki kutudan seçip Ctrl+C yapabilirsiniz.', 'info');
       }
     }
 
+    async function handleAutoSetup(e: React.FormEvent) {
+      e.preventDefault();
+      if (!accessToken.trim()) return;
+      setAutoSettingUp(true);
+      try {
+        const res = await fetch('/api/admin/auto-setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accessToken: accessToken.trim() }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          showToast(data.error || 'Otomatik kurulum başarısız oldu', 'error');
+          return;
+        }
+        setAccessToken('');
+        showToast('Kurulum tamamlandı!', 'success', 'Artık ilk yönetici hesabını oluşturabilirsiniz.');
+        await verifyAdmin();
+      } finally {
+        setAutoSettingUp(false);
+      }
+    }
+
     return (
       <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center px-4 py-12">
-        <div className="w-full max-w-2xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8 shadow-sm">
-          <div className="flex items-center gap-2 text-xs font-semibold text-[#0F2942]">
-            <Database className="h-4 w-4 text-emerald-700" />
-            <span>Supabase Bağlantısı Aktif — Son Adım: Tablo Kurulumu</span>
-          </div>
-          <h1 className="mt-2 text-xl font-bold text-slate-900">
-            Veritabanı Tablolarını Tek Seferde Oluşturun
-          </h1>
-          <p className="mt-2 text-xs leading-relaxed text-slate-600">
-            Supabase anahtarlarınız bağlandı ancak veritabanında henüz EsnafTakip tabloları
-            bulunmuyor. Aşağıdaki 3 adımı uyguladıktan sonra yönetici hesabınızı oluşturabilirsiniz:
-          </p>
-
-          <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <button
-              type="button"
-              onClick={handleCopySql}
-              disabled={!sqlScript}
-              className="flex items-center justify-center gap-2 rounded-lg bg-[#0F2942] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#173B5E] disabled:opacity-60"
-            >
-              {sqlCopied ? <Check className="h-4 w-4 text-emerald-300" /> : <Copy className="h-4 w-4" />}
-              <span>{sqlCopied ? 'Kopyalandı!' : '1. SQL Kodunu Kopyala'}</span>
-            </button>
-
-            <a
-              href={sqlEditorUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-xs font-semibold text-slate-800 hover:bg-slate-50"
-            >
-              <ExternalLink className="h-4 w-4" />
-              <span>2. SQL Editor&apos;ü Aç &amp; Run Yap</span>
-            </a>
-
-            <button
-              type="button"
-              onClick={() => verifyAdmin()}
-              className="flex items-center justify-center gap-2 rounded-lg bg-emerald-700 px-4 py-2.5 text-xs font-semibold text-white hover:bg-emerald-800"
-            >
-              <RefreshCw className="h-4 w-4" />
-              <span>3. Kurulumu Kontrol Et</span>
-            </button>
-          </div>
-
-          {sqlScript && (
-            <div className="mt-5">
-              <label className="block text-[11px] font-medium text-slate-500">
-                Tek Seferlik Kurulum SQL İçeriği (`supabase/TEK_SEFERLIK_KURULUM.sql`)
-              </label>
-              <textarea
-                readOnly
-                rows={8}
-                value={sqlScript}
-                onFocus={(e) => e.currentTarget.select()}
-                className="mt-1.5 w-full rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-700"
-              />
+        <div className="w-full max-w-2xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8 shadow-sm space-y-6">
+          <div>
+            <div className="flex items-center gap-2 text-xs font-semibold text-[#0F2942]">
+              <Database className="h-4 w-4 text-emerald-700" />
+              <span>
+                {isGrantsOnly
+                  ? '23 Tablo Oluşturulmuş — Son Adım: Erişim İzni (4 Satır)'
+                  : 'Supabase Bağlantısı Aktif — Son Adım: Tablo Kurulumu'}
+              </span>
             </div>
-          )}
+            <h1 className="mt-2 text-xl font-bold text-slate-900">
+              {isGrantsOnly
+                ? 'Tablolar Hazır! Yalnızca Erişim İznini Açın'
+                : 'Veritabanı Tablolarını Tek Seferde Oluşturun'}
+            </h1>
+            <p className="mt-2 text-xs leading-relaxed text-slate-600">
+              {isGrantsOnly
+                ? 'Veritabanı tablolarınız Supabase üzerinde başarıyla oluşturulmuş görünüyor. Ancak Supabase API anahtarlarının bu tabloları okuyabilmesi için aşağıdaki tek seferlik izin işlemini tamamlamanız gerekiyor.'
+                : 'Supabase anahtarlarınız bağlandı ancak veritabanında henüz EsnafTakip tabloları bulunmuyor. Aşağıdaki iki yöntemden dilediğinizi kullanabilirsiniz:'}
+            </p>
+          </div>
+
+          <form
+            onSubmit={handleAutoSetup}
+            className="rounded-lg border border-emerald-200 bg-emerald-50/60 p-4 space-y-3"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-emerald-900">
+                <KeyRound className="h-4 w-4 text-emerald-700" />
+                <span>Yöntem 1 (SQL Editörü Açmadan Otomatik Tamamla)</span>
+              </div>
+              <a
+                href="https://supabase.com/dashboard/account/tokens"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-800 underline hover:text-emerald-950"
+              >
+                <span>Access Token Oluştur (sbp_...)</span>
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            </div>
+            <p className="text-[11px] text-emerald-900/80">
+              Yukarıdaki bağlantıdan <strong>Generate new token</strong> diyerek alacağınız{' '}
+              <code>sbp_...</code> kodunu yapıştırın; sistem tüm kurulumu sizin yerinize tek tıkla tamamlasın.
+            </p>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="password"
+                value={accessToken}
+                onChange={(e) => setAccessToken(e.target.value)}
+                placeholder="sbp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                className="flex-1 rounded-lg border border-emerald-300 bg-white px-3 py-2 text-xs font-mono text-slate-800"
+              />
+              <button
+                type="submit"
+                disabled={autoSettingUp || !accessToken.trim()}
+                className="rounded-lg bg-emerald-700 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-60 whitespace-nowrap"
+              >
+                {autoSettingUp ? 'Çalıştırılıyor...' : 'Otomatik Kurulumu Tamamla'}
+              </button>
+            </div>
+          </form>
+
+          <div className="border-t border-slate-200 pt-5 space-y-4">
+            <p className="text-xs font-semibold text-slate-800">
+              Yöntem 2: Supabase SQL Editor ile {isGrantsOnly ? '4 Satırı Çalıştır' : 'Kodu Çalıştır'}
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <button
+                type="button"
+                onClick={handleCopySql}
+                disabled={!activeSql}
+                className="flex items-center justify-center gap-2 rounded-lg bg-[#0F2942] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#173B5E] disabled:opacity-60"
+              >
+                {sqlCopied ? <Check className="h-4 w-4 text-emerald-300" /> : <Copy className="h-4 w-4" />}
+                <span>{sqlCopied ? 'Kopyalandı!' : '1. Kodu Kopyala'}</span>
+              </button>
+
+              <a
+                href={sqlEditorUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-xs font-semibold text-slate-800 hover:bg-slate-50"
+              >
+                <ExternalLink className="h-4 w-4" />
+                <span>2. SQL Editor&apos;ü Aç &amp; Run Yap</span>
+              </a>
+
+              <button
+                type="button"
+                onClick={() => verifyAdmin()}
+                className="flex items-center justify-center gap-2 rounded-lg bg-emerald-700 px-4 py-2.5 text-xs font-semibold text-white hover:bg-emerald-800"
+              >
+                <RefreshCw className="h-4 w-4" />
+                <span>3. Kurulumu Kontrol Et</span>
+              </button>
+            </div>
+
+            {activeSql && (
+              <div>
+                <label className="block text-[11px] font-medium text-slate-500">
+                  {isGrantsOnly
+                    ? 'Çalıştırılacak 4 Satırlık Erişim İzni Kodu'
+                    : 'Tek Seferlik Kurulum SQL İçeriği (supabase/TEK_SEFERLIK_KURULUM.sql)'}
+                </label>
+                <textarea
+                  readOnly
+                  rows={isGrantsOnly ? 4 : 7}
+                  value={activeSql}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="mt-1.5 w-full rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-700"
+                />
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );

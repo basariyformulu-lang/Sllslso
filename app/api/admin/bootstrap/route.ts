@@ -34,11 +34,24 @@ function isMissingTableError(err: { code?: string; message?: string } | null): b
   );
 }
 
+const GRANT_SQL = `GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL FUNCTIONS IN SCHEMA public TO postgres, anon, authenticated, service_role;`;
+
+function isPermissionDeniedError(err: { code?: string; message?: string } | null): boolean {
+  if (!err) return false;
+  const code = err.code || '';
+  const msg = (err.message || '').toLowerCase();
+  return code === '42501' || msg.includes('permission denied');
+}
+
 export async function GET(req: NextRequest) {
   if (!isServiceRoleConfigured()) {
     return NextResponse.json({
       configured: false,
       schemaReady: false,
+      permissionsReady: false,
       hasAdmin: false,
       requiresSecret: false,
       projectRef: null,
@@ -68,10 +81,23 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       configured: true,
       schemaReady: false,
+      permissionsReady: false,
       hasAdmin: false,
       requiresSecret: false,
       projectRef,
       sqlScript,
+    });
+  }
+
+  if (error && isPermissionDeniedError(error)) {
+    return NextResponse.json({
+      configured: true,
+      schemaReady: true,
+      permissionsReady: false,
+      hasAdmin: false,
+      requiresSecret: false,
+      projectRef,
+      grantSql: req.nextUrl.searchParams.get('includeSql') === '1' ? GRANT_SQL : undefined,
     });
   }
 
@@ -82,6 +108,7 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({
     configured: true,
     schemaReady: !error,
+    permissionsReady: !error,
     hasAdmin: (admins?.length ?? 0) > 0 || (count ?? 0) > 0,
     requiresSecret: Boolean(process.env.ADMIN_BOOTSTRAP_SECRET?.trim()),
     projectRef,
