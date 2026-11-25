@@ -1,0 +1,6 @@
+{
+  "name": "EsnafTakip — Küçük İşletmeler İçin Cari Hesap ve Finans Yönetim Sistemi",
+  "description": "Küçük işletmeler, bakkallar, büfeler ve toptancılar için müşteri alacakları, toptancı borçları, vadeli satış ve sabit gider takip platformu.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
