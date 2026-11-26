@@ -125,6 +125,13 @@ export async function POST(req: NextRequest) {
     });
 
     // 3. İşletme kaydı oluştur (Ödeme Bekliyor)
+    const { data: sysCfg } = await db
+      .from('system_settings')
+      .select('booking_module_default_included')
+      .eq('id', 1)
+      .maybeSingle();
+    const bookingIncluded = sysCfg?.booking_module_default_included !== false;
+
     const businessCode = generateBusinessCode();
     const { data: business, error: bizErr } = await db
       .from('businesses')
@@ -136,6 +143,8 @@ export async function POST(req: NextRequest) {
         email: data.email,
         subscription_status: 'payment_pending',
         is_active: true,
+        booking_module_enabled: bookingIncluded,
+        booking_module_mode: bookingIncluded ? 'included' : 'addon_locked',
       })
       .select('*')
       .single();

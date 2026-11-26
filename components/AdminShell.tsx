@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Database,
   KeyRound,
+  CalendarCheck,
 } from 'lucide-react';
 import { createBrowserSupabase } from '@/lib/supabase/client';
 import { useToast } from '@/components/ToastProvider';
@@ -29,6 +30,7 @@ import { SetupNotice } from '@/components/SetupNotice';
 const ADMIN_NAV = [
   { href: '/admin', label: 'Yönetici Ana Ekranı', icon: LayoutDashboard },
   { href: '/admin/isletmeler', label: 'İşletme Yönetimi', icon: Building2 },
+  { href: '/admin/randevu', label: 'Online Randevu Modülü', icon: CalendarCheck },
   { href: '/admin/odeme-talepleri', label: 'Ödeme Talepleri', icon: CreditCard },
   { href: '/admin/abonelik-ayarlari', label: 'Abonelik Ayarları', icon: PackageCheck },
   { href: '/admin/banka-hesaplari', label: 'Banka Hesapları (IBAN)', icon: Landmark },

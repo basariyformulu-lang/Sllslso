@@ -19,6 +19,8 @@ export interface SystemSettings {
   pricing_description: string;
   terms_of_service: string;
   privacy_policy: string;
+  booking_module_default_included?: boolean;
+  booking_module_addon_price?: number;
   updated_at?: string;
 }
 
@@ -57,6 +59,8 @@ export interface Business {
   subscription_start_at: string | null;
   subscription_end_at: string | null;
   is_active: boolean;
+  booking_module_enabled?: boolean;
+  booking_module_mode?: 'included' | 'addon_active' | 'addon_locked';
   created_at: string;
 }
 
@@ -194,3 +198,237 @@ export interface RecurringExpensePeriod {
   expense_transaction_id: string | null;
   recurring_expense?: RecurringExpense;
 }
+
+export interface BookingGalleryItem {
+  id: string;
+  url: string;
+  caption?: string;
+  sort_order: number;
+}
+
+export interface BookingBusinessHour {
+  day: number;
+  label: string;
+  open: string;
+  close: string;
+  is_open: boolean;
+}
+
+export interface BookingSectionVisibility {
+  hero: boolean;
+  services: boolean;
+  staff: boolean;
+  gallery: boolean;
+  reviews: boolean;
+  hours: boolean;
+  contact: boolean;
+}
+
+export interface BookingPage {
+  id: string;
+  business_id: string;
+  slug: string;
+  page_title: string;
+  description: string;
+  logo_url: string;
+  cover_image_url: string;
+  gallery_images: BookingGalleryItem[];
+  phone: string;
+  whatsapp: string;
+  address: string;
+  map_location: string;
+  instagram_url: string;
+  theme_preset: 'classic_navy' | 'botanical_emerald' | 'warm_atelier' | 'minimal_mono' | 'soft_rose';
+  primary_color: string;
+  secondary_color: string;
+  section_visibility: BookingSectionVisibility;
+  business_hours: BookingBusinessHour[];
+  slot_interval_minutes: number;
+  min_advance_minutes: number;
+  max_advance_days: number;
+  cancellation_deadline_hours: number;
+  auto_confirm: boolean;
+  status: 'draft' | 'published' | 'paused';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BookingService {
+  id: string;
+  business_id: string;
+  name: string;
+  description: string;
+  image_url: string;
+  price: number;
+  discount_price: number | null;
+  duration_minutes: number;
+  sort_order: number;
+  is_active: boolean;
+  staff_ids?: string[];
+  created_at: string;
+}
+
+export interface BookingStaff {
+  id: string;
+  business_id: string;
+  full_name: string;
+  avatar_url: string;
+  specialties: string;
+  bio: string;
+  is_active: boolean;
+  sort_order: number;
+  service_ids?: string[];
+  working_hours?: StaffWorkingHour[];
+  breaks?: StaffBreak[];
+  created_at: string;
+}
+
+export interface StaffWorkingHour {
+  id?: string;
+  business_id?: string;
+  staff_id: string;
+  day_of_week: number;
+  is_working: boolean;
+  start_time: string;
+  end_time: string;
+}
+
+export interface StaffBreak {
+  id: string;
+  business_id: string;
+  staff_id: string;
+  day_of_week: number | null;
+  title: string;
+  start_time: string;
+  end_time: string;
+}
+
+export interface StaffLeave {
+  id: string;
+  business_id: string;
+  staff_id: string | null;
+  start_date: string;
+  end_date: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface CustomerAccount {
+  user_id: string;
+  first_name: string;
+  last_name: string;
+  phone: string;
+  email: string;
+  created_at: string;
+}
+
+export interface BookingCustomer {
+  id: string;
+  business_id: string;
+  customer_user_id: string | null;
+  first_name: string;
+  last_name: string;
+  phone: string;
+  email: string;
+  notes: string;
+  is_active: boolean;
+  created_at: string;
+  appointment_count?: number;
+  completed_count?: number;
+  total_spent?: number;
+  last_appointment_date?: string | null;
+}
+
+export type AppointmentStatus = 'pending' | 'confirmed' | 'completed' | 'cancelled' | 'no_show';
+export type AppointmentPaymentStatus = 'unpaid' | 'partial' | 'paid' | 'refunded';
+
+export interface Appointment {
+  id: string;
+  business_id: string;
+  booking_customer_id: string;
+  customer_user_id: string | null;
+  service_id: string | null;
+  staff_id: string | null;
+  service_name_snapshot: string;
+  service_price_snapshot: number;
+  service_duration_snapshot: number;
+  staff_name_snapshot: string;
+  appointment_date: string;
+  start_time: string;
+  end_time: string;
+  start_at: string;
+  end_at: string;
+  status: AppointmentStatus;
+  payment_status: AppointmentPaymentStatus;
+  paid_amount: number;
+  customer_notes: string;
+  business_notes: string;
+  source: 'online' | 'panel';
+  cancelled_by: 'customer' | 'business' | null;
+  cancellation_reason: string;
+  created_at: string;
+  customer?: {
+    id: string;
+    first_name: string;
+    last_name: string;
+    phone: string;
+    email: string;
+  };
+  business?: {
+    id: string;
+    name: string;
+    booking_slug?: string;
+  };
+  review?: AppointmentReview | null;
+}
+
+export interface AppointmentPayment {
+  id: string;
+  business_id: string;
+  appointment_id: string;
+  amount: number;
+  payment_type: 'collection' | 'refund';
+  payment_method: PaymentMethod;
+  payment_date: string;
+  income_transaction_id: string | null;
+  expense_transaction_id: string | null;
+  notes: string;
+  created_at: string;
+}
+
+export interface AppointmentReview {
+  id: string;
+  business_id: string;
+  appointment_id: string;
+  customer_user_id: string;
+  service_id: string | null;
+  staff_id: string | null;
+  rating: number;
+  comment: string;
+  business_reply: string | null;
+  replied_at: string | null;
+  moderation_status: 'published' | 'reported' | 'hidden';
+  report_reason: string | null;
+  reported_at: string | null;
+  moderation_note: string | null;
+  created_at: string;
+  customer_name?: string;
+  service_name?: string;
+  staff_name?: string;
+}
+
+export interface AppointmentNotification {
+  id: string;
+  business_id: string;
+  appointment_id: string | null;
+  recipient_type: 'business' | 'customer';
+  recipient_user_id: string | null;
+  notification_type: string;
+  channel: string;
+  title: string;
+  message: string;
+  delivery_status: string;
+  is_read: boolean;
+  created_at: string;
+}
+

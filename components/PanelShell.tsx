@@ -18,6 +18,16 @@ import {
   LogOut,
   Menu,
   X,
+  CalendarCheck,
+  ChevronDown,
+  ChevronRight,
+  CalendarDays,
+  Scissors,
+  UserCheck,
+  Clock,
+  MessageSquare,
+  Palette,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { createBrowserSupabase } from '@/lib/supabase/client';
 import { hasPermission } from '@/lib/permissions';
@@ -44,6 +54,18 @@ const NAV_ITEMS: NavItem[] = [
   { href: '/panel/ayarlar', label: 'Profil ve Ayarlar', icon: Settings },
 ];
 
+const BOOKING_NAV_ITEMS: NavItem[] = [
+  { href: '/panel/randevu', label: 'Randevu Genel Bakış', icon: CalendarCheck, permission: 'booking.view' },
+  { href: '/panel/randevu/takvim', label: 'Randevu Takvimi', icon: CalendarDays, permission: 'booking.view' },
+  { href: '/panel/randevu/hizmetler', label: 'Hizmetler ve Fiyatlar', icon: Scissors, permission: 'booking.view' },
+  { href: '/panel/randevu/personel', label: 'Personel Yönetimi', icon: UserCheck, permission: 'booking.view' },
+  { href: '/panel/randevu/calisma-saatleri', label: 'Çalışma Saatleri', icon: Clock, permission: 'booking.view' },
+  { href: '/panel/randevu/musteriler', label: 'Müşteri Yönetimi', icon: Users, permission: 'booking.view' },
+  { href: '/panel/randevu/yorumlar', label: 'Müşteri Yorumları', icon: MessageSquare, permission: 'booking.view' },
+  { href: '/panel/randevu/tasarim', label: 'Randevu Sayfası Tasarımı', icon: Palette, permission: 'booking.view' },
+  { href: '/panel/randevu/ayarlar', label: 'Randevu Sayfası Ayarları', icon: SlidersHorizontal, permission: 'booking.view' },
+];
+
 export interface PanelUserContext {
   id: string;
   email: string;
@@ -57,6 +79,9 @@ export function PanelShell({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const [userCtx, setUserCtx] = useState<PanelUserContext | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [bookingExpanded, setBookingExpanded] = useState<boolean>(() =>
+    pathname.startsWith('/panel/randevu')
+  );
   const [unreadCount, setUnreadCount] = useState(0);
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifications, setNotifications] = useState<
@@ -151,19 +176,24 @@ export function PanelShell({ children }: { children: React.ReactNode }) {
   const visibleNav = NAV_ITEMS.filter(
     (item) => !item.permission || hasPermission(userCtx.member, item.permission)
   );
+  const visibleBookingNav = BOOKING_NAV_ITEMS.filter(
+    (item) => !item.permission || hasPermission(userCtx.member, item.permission)
+  );
+  const isBookingRoute = pathname.startsWith('/panel/randevu');
+  const showBookingList = bookingExpanded || isBookingRoute;
 
   const sidebarContent = (
     <div className="flex h-full flex-col justify-between bg-[#0F2942] text-slate-100">
-      <div>
-        <div className="border-b border-slate-700/60 px-5 py-5">
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="shrink-0 border-b border-slate-700/60 px-5 py-5">
           <Link href="/panel" className="text-lg font-bold tracking-tight text-white font-display">
             EsnafTakip
           </Link>
           <p className="mt-1 truncate text-xs text-slate-300">{userCtx.business.name}</p>
         </div>
 
-        <nav className="mt-4 space-y-1 px-3">
-          {visibleNav.map((item) => {
+        <nav className="mt-3 flex-1 space-y-1 overflow-y-auto px-3 pb-4">
+          {visibleNav.slice(0, 8).map((item) => {
             const Icon = item.icon;
             const active =
               item.href === '/panel'
@@ -174,7 +204,7 @@ export function PanelShell({ children }: { children: React.ReactNode }) {
                 key={item.href}
                 href={item.href}
                 onClick={() => setMobileOpen(false)}
-                className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors whitespace-nowrap ${
+                className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors whitespace-nowrap ${
                   active
                     ? 'bg-white/15 text-white'
                     : 'text-slate-300 hover:bg-white/10 hover:text-white'
@@ -185,10 +215,83 @@ export function PanelShell({ children }: { children: React.ReactNode }) {
               </Link>
             );
           })}
+
+          {visibleBookingNav.length > 0 && (
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={() => setBookingExpanded((prev) => !prev)}
+                className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                  isBookingRoute
+                    ? 'bg-emerald-700/35 text-white'
+                    : 'text-emerald-200 hover:bg-white/10 hover:text-white'
+                }`}
+              >
+                <span className="flex items-center gap-3 whitespace-nowrap">
+                  <CalendarCheck className="h-4 w-4 shrink-0 text-emerald-300" />
+                  <span>Online Randevu</span>
+                </span>
+                {showBookingList ? (
+                  <ChevronDown className="h-4 w-4 shrink-0 text-slate-300" />
+                ) : (
+                  <ChevronRight className="h-4 w-4 shrink-0 text-slate-300" />
+                )}
+              </button>
+
+              {showBookingList && (
+                <div className="mt-1 ml-3 space-y-0.5 border-l border-slate-700/70 pl-2.5">
+                  {visibleBookingNav.map((item) => {
+                    const Icon = item.icon;
+                    const active =
+                      item.href === '/panel/randevu'
+                        ? pathname === '/panel/randevu'
+                        : pathname.startsWith(item.href);
+                    return (
+                      <Link
+                        key={item.href}
+                        href={item.href}
+                        onClick={() => setMobileOpen(false)}
+                        className={`flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
+                          active
+                            ? 'bg-white/15 text-white'
+                            : 'text-slate-300 hover:bg-white/10 hover:text-white'
+                        }`}
+                      >
+                        <Icon className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{item.label}</span>
+                      </Link>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          <div className="pt-2">
+            {visibleNav.slice(8).map((item) => {
+              const Icon = item.icon;
+              const active = pathname.startsWith(item.href);
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  onClick={() => setMobileOpen(false)}
+                  className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors whitespace-nowrap ${
+                    active
+                      ? 'bg-white/15 text-white'
+                      : 'text-slate-300 hover:bg-white/10 hover:text-white'
+                  }`}
+                >
+                  <Icon className="h-4 w-4 shrink-0" />
+                  <span>{item.label}</span>
+                </Link>
+              );
+            })}
+          </div>
         </nav>
       </div>
 
-      <div className="border-t border-slate-700/60 p-4 text-xs">
+      <div className="shrink-0 border-t border-slate-700/60 p-4 text-xs">
         <div className="mb-3">
           <p className="font-semibold text-white truncate">
             {userCtx.member.profile?.first_name} {userCtx.member.profile?.last_name}

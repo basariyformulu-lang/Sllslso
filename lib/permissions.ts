@@ -32,6 +32,12 @@ export const ALL_PERMISSIONS: PermissionDef[] = [
   { code: 'recurring.delete', module: 'Sabit Giderler', label: 'Sabit gider pasifleştirme' },
   { code: 'recurring.pay', module: 'Sabit Giderler', label: 'Sabit gider ödemesi kaydetme' },
   { code: 'users.manage', module: 'Kullanıcı Yönetimi', label: 'İşletme kullanıcılarını ve yetkilerini yönetme' },
+  { code: 'booking.view', module: 'Online Randevu', label: 'Randevu takvimi, genel bakış ve yorumları görüntüleme' },
+  { code: 'booking.manage', module: 'Online Randevu', label: 'Randevu oluşturma, düzenleme, onay ve iptal işlemleri' },
+  { code: 'booking.services', module: 'Online Randevu', label: 'Randevu hizmet ve fiyatlarını yönetme' },
+  { code: 'booking.staff', module: 'Online Randevu', label: 'Personel, çalışma saatleri ve izin yönetimi' },
+  { code: 'booking.design', module: 'Online Randevu', label: 'Online randevu sayfası tasarımı ve ayarlarını yönetme' },
+  { code: 'booking.payments', module: 'Online Randevu', label: 'Randevu tahsilatı ve iade işlemleri' },
 ];
 
 export const ALL_PERMISSION_CODES = ALL_PERMISSIONS.map((p) => p.code);

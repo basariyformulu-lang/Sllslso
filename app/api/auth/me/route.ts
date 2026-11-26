@@ -34,6 +34,7 @@ export async function GET() {
       member: ctx.member,
       business: ctx.business,
       isSubscriptionActive: ctx.isSubscriptionActive,
+      customerAccount: ctx.customerAccount,
       unreadNotifications,
     },
   });

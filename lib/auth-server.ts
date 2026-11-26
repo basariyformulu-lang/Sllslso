@@ -6,7 +6,7 @@ import {
   isSupabaseConfigured,
 } from '@/lib/supabase/server';
 import { hasPermission } from '@/lib/permissions';
-import type { Business, BusinessMember } from '@/lib/types';
+import type { Business, BusinessMember, CustomerAccount } from '@/lib/types';
 
 export interface AuthContext {
   userId: string;
@@ -16,6 +16,7 @@ export interface AuthContext {
   member: BusinessMember | null;
   business: Business | null;
   isSubscriptionActive: boolean;
+  customerAccount: CustomerAccount | null;
 }
 
 export async function getAuthContext(): Promise<AuthContext | null> {
@@ -33,19 +34,25 @@ export async function getAuthContext(): Promise<AuthContext | null> {
 
   if (!user) return null;
 
-  const { data: adminRow } = await adminDb
-    .from('system_admins')
-    .select('*')
-    .eq('user_id', user.id)
-    .eq('is_active', true)
-    .maybeSingle();
-
-  const { data: memberRow } = await adminDb
-    .from('business_members')
-    .select('*, profile:profiles(id, first_name, last_name, phone, email)')
-    .eq('user_id', user.id)
-    .eq('is_active', true)
-    .maybeSingle();
+  const [{ data: adminRow }, { data: memberRow }, { data: custRow }] = await Promise.all([
+    adminDb
+      .from('system_admins')
+      .select('*')
+      .eq('user_id', user.id)
+      .eq('is_active', true)
+      .maybeSingle(),
+    adminDb
+      .from('business_members')
+      .select('*, profile:profiles(id, first_name, last_name, phone, email)')
+      .eq('user_id', user.id)
+      .eq('is_active', true)
+      .maybeSingle(),
+    adminDb
+      .from('customer_accounts')
+      .select('*')
+      .eq('user_id', user.id)
+      .maybeSingle(),
+  ]);
 
   let business: Business | null = null;
   let isSubscriptionActive = false;
@@ -98,6 +105,7 @@ export async function getAuthContext(): Promise<AuthContext | null> {
       : null,
     business,
     isSubscriptionActive,
+    customerAccount: (custRow as CustomerAccount) ?? null,
   };
 }
 
@@ -153,6 +161,129 @@ export async function requireBusinessContext(permissionCode?: string) {
   }
 
   const db = createServiceRoleSupabase()!;
+  return { error: null, ctx, db };
+}
+
+export async function requireBusinessBookingContext(
+  permissionCode?: string,
+  allowReadOnly = false
+) {
+  if (!isSupabaseConfigured() || !isServiceRoleConfigured()) {
+    return {
+      error: NextResponse.json(
+        { error: 'Supabase veritabanı yapılandırılmamış.' },
+        { status: 503 }
+      ),
+      ctx: null,
+      db: null,
+      readOnly: false,
+    };
+  }
+
+  const ctx = await getAuthContext();
+  if (!ctx) {
+    return {
+      error: NextResponse.json({ error: 'Oturum açmanız gerekiyor.' }, { status: 401 }),
+      ctx: null,
+      db: null,
+      readOnly: false,
+    };
+  }
+
+  if (!ctx.member || !ctx.business) {
+    return {
+      error: NextResponse.json({ error: 'İşletme üyeliği bulunamadı.' }, { status: 403 }),
+      ctx: null,
+      db: null,
+      readOnly: false,
+    };
+  }
+
+  if (permissionCode && !hasPermission(ctx.member, permissionCode)) {
+    return {
+      error: NextResponse.json(
+        { error: 'Bu işlem için yetkiniz bulunmuyor.' },
+        { status: 403 }
+      ),
+      ctx: null,
+      db: null,
+      readOnly: false,
+    };
+  }
+
+  const moduleEnabled =
+    ctx.business.booking_module_enabled !== false &&
+    ctx.business.booking_module_mode !== 'addon_locked';
+  const readOnly = !ctx.isSubscriptionActive || !moduleEnabled;
+
+  if (readOnly && !allowReadOnly) {
+    return {
+      error: NextResponse.json(
+        {
+          error: !ctx.isSubscriptionActive
+            ? 'İşletme aboneliği aktif olmadığı için randevu modülü yalnızca görüntüleme modundadır.'
+            : 'Online randevu modülü aboneliğinizde kilitli durumdadır.',
+        },
+        { status: !ctx.isSubscriptionActive ? 402 : 403 }
+      ),
+      ctx: null,
+      db: null,
+      readOnly: true,
+    };
+  }
+
+  const db = createServiceRoleSupabase()!;
+  return { error: null, ctx, db, readOnly };
+}
+
+export async function requireCustomerContext() {
+  if (!isSupabaseConfigured() || !isServiceRoleConfigured()) {
+    return {
+      error: NextResponse.json(
+        { error: 'Supabase veritabanı yapılandırılmamış.' },
+        { status: 503 }
+      ),
+      ctx: null,
+      db: null,
+    };
+  }
+
+  const ctx = await getAuthContext();
+  if (!ctx) {
+    return {
+      error: NextResponse.json({ error: 'Randevu işlemleri için giriş yapmalısınız.' }, { status: 401 }),
+      ctx: null,
+      db: null,
+    };
+  }
+
+  const db = createServiceRoleSupabase()!;
+
+  // Eğer kullanıcı Supabase Auth ile kayıtlı ama henüz customer_accounts kaydı yoksa profilden senkronize et
+  if (!ctx.customerAccount) {
+    const { data: profile } = await db
+      .from('profiles')
+      .select('*')
+      .eq('id', ctx.userId)
+      .maybeSingle();
+
+    const { data: created } = await db
+      .from('customer_accounts')
+      .upsert({
+        user_id: ctx.userId,
+        first_name: profile?.first_name || 'Müşteri',
+        last_name: profile?.last_name || '',
+        phone: profile?.phone || '',
+        email: profile?.email || ctx.email,
+      })
+      .select('*')
+      .single();
+
+    if (created) {
+      ctx.customerAccount = created as CustomerAccount;
+    }
+  }
+
   return { error: null, ctx, db };
 }
 

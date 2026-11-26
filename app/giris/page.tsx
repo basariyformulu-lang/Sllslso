@@ -62,6 +62,12 @@ export default function LoginPage() {
         return;
       }
 
+      if (!meData.user.member && meData.user.customerAccount) {
+        router.push('/musteri');
+        router.refresh();
+        return;
+      }
+
       if (!meData.user.isSubscriptionActive) {
         router.push('/odeme');
         router.refresh();
@@ -150,11 +156,19 @@ export default function LoginPage() {
               </button>
             </form>
 
-            <div className="mt-6 border-t border-slate-200 pt-5 text-center text-xs text-slate-600">
-              Henüz işletme hesabınız yok mu?{' '}
-              <Link href="/basvuru" className="font-semibold text-[#0F2942] hover:underline">
-                Ücretsiz Başvuru Yapın
-              </Link>
+            <div className="mt-6 border-t border-slate-200 pt-5 space-y-2 text-center text-xs text-slate-600">
+              <p>
+                Henüz işletme hesabınız yok mu?{' '}
+                <Link href="/basvuru" className="font-semibold text-[#0F2942] hover:underline">
+                  Ücretsiz Başvuru Yapın
+                </Link>
+              </p>
+              <p>
+                Randevu müşterisi misiniz?{' '}
+                <Link href="/musteri" className="font-semibold text-emerald-700 hover:underline">
+                  Müşteri Randevu Portalı
+                </Link>
+              </p>
             </div>
           </div>
         )}
