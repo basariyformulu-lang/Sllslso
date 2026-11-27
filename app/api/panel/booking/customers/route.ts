@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessBookingContext } from '@/lib/auth-server';
+import { normalizePhoneTR } from '@/lib/booking-helpers';
+import { execute, query, queryOne, toBool, toIsoString, toMySqlDateTime, uuid } from '@/lib/db';
 import { roundCurrency } from '@/lib/format';
 
 const customerSchema = z.object({
@@ -22,30 +24,40 @@ const patchCustomerSchema = z.object({
 });
 
 export async function GET() {
-  const { error, ctx, db, readOnly } = await requireBusinessBookingContext('booking.view', true);
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx, readOnly } = await requireBusinessBookingContext('booking.view', true);
+  if (error || !ctx || !ctx.business) return error!;
 
   const businessId = ctx.business.id;
-  const [{ data: customers }, { data: appointments }] = await Promise.all([
-    db
-      .from('booking_customers')
-      .select('*')
-      .eq('business_id', businessId)
-      .order('created_at', { ascending: false }),
-    db
-      .from('appointments')
-      .select('id, booking_customer_id, status, paid_amount, appointment_date')
-      .eq('business_id', businessId)
-      .order('appointment_date', { ascending: false }),
+  const [customers, appointments] = await Promise.all([
+    query<Record<string, unknown>>(
+      'SELECT * FROM booking_customers WHERE business_id = ? ORDER BY created_at DESC',
+      [businessId]
+    ),
+    query<{
+      id: string;
+      booking_customer_id: string;
+      status: string;
+      paid_amount: number;
+      appointment_date: string;
+    }>(
+      `SELECT id, booking_customer_id, status, paid_amount, appointment_date
+       FROM appointments
+       WHERE business_id = ?
+       ORDER BY appointment_date DESC`,
+      [businessId]
+    ),
   ]);
 
-  const appts = appointments ?? [];
-  const enriched = (customers ?? []).map((c) => {
-    const custAppts = appts.filter((a) => a.booking_customer_id === c.id);
+  const enriched = customers.map((c) => {
+    const custAppts = appointments.filter((a) => a.booking_customer_id === c.id);
     const completed = custAppts.filter((a) => a.status === 'completed');
-    const totalSpent = roundCurrency(custAppts.reduce((s, a) => s + Number(a.paid_amount ?? 0), 0));
+    const totalSpent = roundCurrency(
+      custAppts.reduce((s, a) => s + Number(a.paid_amount ?? 0), 0)
+    );
     return {
       ...c,
+      is_active: toBool(c.is_active),
+      created_at: toIsoString(c.created_at),
       appointment_count: custAppts.length,
       completed_count: completed.length,
       total_spent: totalSpent,
@@ -57,8 +69,8 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.manage');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.manage');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -76,26 +88,39 @@ export async function POST(req: NextRequest) {
   }
 
   const d = parsed.data;
-  const { data: created, error: createErr } = await db
-    .from('booking_customers')
-    .insert({
-      business_id: ctx.business.id,
-      first_name: d.firstName,
-      last_name: d.lastName,
-      phone: d.phone,
-      email: d.email.toLowerCase(),
-      notes: d.notes,
-    })
-    .select('*')
-    .single();
+  const id = uuid();
+  const nowStr = toMySqlDateTime();
+  await execute(
+    `INSERT INTO booking_customers
+     (id, business_id, customer_user_id, first_name, last_name, phone, phone_normalized, email, notes, is_active, created_at, updated_at)
+     VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    [
+      id,
+      ctx.business.id,
+      d.firstName,
+      d.lastName,
+      d.phone,
+      normalizePhoneTR(d.phone),
+      d.email.toLowerCase(),
+      d.notes,
+      nowStr,
+      nowStr,
+    ]
+  );
 
-  if (createErr) return NextResponse.json({ error: createErr.message }, { status: 500 });
-  return NextResponse.json({ customer: created }, { status: 201 });
+  const created = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM booking_customers WHERE id = ? LIMIT 1',
+    [id]
+  );
+  return NextResponse.json(
+    { customer: created ? { ...created, is_active: toBool(created.is_active) } : null },
+    { status: 201 }
+  );
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.manage');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.manage');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -110,25 +135,35 @@ export async function PATCH(req: NextRequest) {
   }
 
   const d = parsed.data;
-  const { data: updated, error: updErr } = await db
-    .from('booking_customers')
-    .update({
-      first_name: d.firstName,
-      last_name: d.lastName,
-      phone: d.phone,
-      email: d.email.toLowerCase(),
-      notes: d.notes,
-      ...(d.isActive !== undefined ? { is_active: d.isActive } : {}),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', d.id)
-    .eq('business_id', ctx.business.id)
-    .select('*')
-    .maybeSingle();
+  const nowStr = toMySqlDateTime();
+  const res = await execute(
+    `UPDATE booking_customers
+     SET first_name = ?, last_name = ?, phone = ?, phone_normalized = ?, email = ?, notes = ?,
+         is_active = COALESCE(?, is_active), updated_at = ?
+     WHERE id = ? AND business_id = ?`,
+    [
+      d.firstName,
+      d.lastName,
+      d.phone,
+      normalizePhoneTR(d.phone),
+      d.email.toLowerCase(),
+      d.notes,
+      d.isActive !== undefined ? (d.isActive ? 1 : 0) : null,
+      nowStr,
+      d.id,
+      ctx.business.id,
+    ]
+  );
 
-  if (updErr || !updated) {
+  if (res.affectedRows === 0) {
     return NextResponse.json({ error: 'Müşteri güncellenemedi.' }, { status: 400 });
   }
 
-  return NextResponse.json({ customer: updated });
+  const updated = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM booking_customers WHERE id = ? LIMIT 1',
+    [d.id]
+  );
+  return NextResponse.json({
+    customer: updated ? { ...updated, is_active: toBool(updated.is_active) } : null,
+  });
 }

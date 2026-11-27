@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, Trash2 } from 'lucide-react';
+import { ArrowLeft, KeyRound, Trash2, X } from 'lucide-react';
 import { formatCurrencyTRY, formatDateTimeTR, formatDateTR } from '@/lib/format';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { getSubscriptionStatusDisplay, StatusText } from '@/components/ui/StatusText';
@@ -18,6 +18,8 @@ export default function AdminBusinessDetailPage() {
   const [saving, setSaving] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [detail, setDetail] = useState<any>(null);
+  const [pwTarget, setPwTarget] = useState<{ userId: string; name: string; email: string } | null>(null);
+  const [newPassword, setNewPassword] = useState('');
 
   const [form, setForm] = useState({
     name: '',
@@ -147,6 +149,33 @@ export default function AdminBusinessDetailPage() {
       }
       showToast('İşletme arşivi alınarak silindi', 'info');
       router.push('/admin/isletmeler');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleSetMemberPassword(e: React.FormEvent) {
+    e.preventDefault();
+    if (!pwTarget) return;
+    setSaving(true);
+    try {
+      const res = await fetch(`/api/admin/businesses/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: pwTarget.userId,
+          newPassword,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showToast(data.error || 'Şifre tanımlanamadı', 'error');
+        return;
+      }
+      showToast('Kullanıcı şifresi tanımlandı', 'success');
+      setPwTarget(null);
+      setNewPassword('');
+      await loadDetail();
     } finally {
       setSaving(false);
     }
@@ -392,7 +421,8 @@ export default function AdminBusinessDetailPage() {
                 <tr>
                   <th className="px-3 py-2 font-semibold">Ad Soyad</th>
                   <th className="px-3 py-2 font-semibold">E-posta</th>
-                  <th className="px-3 py-2 font-semibold">Rol</th>
+                  <th className="px-3 py-2 font-semibold">Rol / Şifre</th>
+                  <th className="px-3 py-2 text-right font-semibold">İşlem</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -403,7 +433,33 @@ export default function AdminBusinessDetailPage() {
                         {m.profile?.first_name} {m.profile?.last_name}
                       </td>
                       <td className="px-3 py-2 text-slate-600">{m.profile?.email}</td>
-                      <td className="px-3 py-2 text-slate-700">{m.role_name}</td>
+                      <td className="px-3 py-2 text-slate-700">
+                        <div>{m.role_name}</div>
+                        <span
+                          className={`text-[10px] font-semibold ${
+                            m.has_password ? 'text-emerald-700' : 'text-amber-700'
+                          }`}
+                        >
+                          {m.has_password ? 'Şifre Tanımlı' : 'Şifre Belirlenmemiş'}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPwTarget({
+                              userId: m.user_id,
+                              name: `${m.profile?.first_name ?? ''} ${m.profile?.last_name ?? ''}`.trim(),
+                              email: m.profile?.email ?? '',
+                            });
+                            setNewPassword('');
+                          }}
+                          className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                        >
+                          <KeyRound className="h-3 w-3" />
+                          <span>Şifre Tanımla</span>
+                        </button>
+                      </td>
                     </tr>
                   )
                 )}
@@ -477,6 +533,55 @@ export default function AdminBusinessDetailPage() {
         onConfirm={handleDeleteBusiness}
         onCancel={() => setDeleteOpen(false)}
       />
+
+      {pwTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
+          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <h3 className="text-base font-bold text-slate-900">Kullanıcı Şifresi Tanımla</h3>
+              <button
+                type="button"
+                onClick={() => setPwTarget(null)}
+                className="rounded p-1 text-slate-400 hover:bg-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-slate-600">
+              <strong>{pwTarget.name}</strong> ({pwTarget.email}) için yeni giriş şifresi belirleyin.
+            </p>
+            <form onSubmit={handleSetMemberPassword} className="mt-4 space-y-4 text-xs">
+              <div>
+                <label className="block font-medium text-slate-700">Yeni Şifre (en az 8 karakter) *</label>
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                />
+              </div>
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPwTarget(null)}
+                  className="rounded-lg border border-slate-200 px-4 py-2 font-medium text-slate-700"
+                >
+                  Vazgeç
+                </button>
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="rounded-lg bg-[#0F2942] px-4 py-2 font-semibold text-white hover:bg-[#173B5E] disabled:opacity-50"
+                >
+                  {saving ? 'Kaydediliyor...' : 'Şifreyi Kaydet'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

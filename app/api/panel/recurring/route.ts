@@ -1,6 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessContext } from '@/lib/auth-server';
+import {
+  execute,
+  query,
+  queryOne,
+  toBool,
+  toMySqlDateTime,
+  uuid,
+  withTransaction,
+} from '@/lib/db';
 import { buildMonthDueDate, getIstanbulMonthBounds, roundCurrency } from '@/lib/format';
 
 const RECURRING_CATEGORIES = [
@@ -60,74 +69,99 @@ function shouldIncludeMonth(
 }
 
 export async function GET(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessContext('recurring.view');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('recurring.view');
+  if (error || !ctx || !ctx.business) return error!;
 
   const { searchParams } = new URL(req.url);
   const { year: curYear, month: curMonth } = getIstanbulMonthBounds();
   const targetYear = Number(searchParams.get('year')) || curYear;
   const targetMonth = Number(searchParams.get('month')) || curMonth;
 
-  const { data: cards, error: cardsErr } = await db
-    .from('recurring_expenses')
-    .select('*')
-    .eq('business_id', ctx.business.id)
-    .order('is_active', { ascending: false })
-    .order('payment_day', { ascending: true });
+  const cards = await query<Record<string, unknown>>(
+    'SELECT * FROM recurring_expenses WHERE business_id = ? ORDER BY is_active DESC, payment_day ASC',
+    [ctx.business.id]
+  );
 
-  if (cardsErr) return NextResponse.json({ error: cardsErr.message }, { status: 500 });
-
-  // Seçili ay için aktif sabit gider dönemlerini otomatik oluştur (zaten varsa veya ödenmişse dokunma!)
-  for (const card of cards ?? []) {
-    if (!card.is_active) continue;
+  for (const card of cards) {
+    if (!toBool(card.is_active)) continue;
     const [sYear, sMonth] = String(card.start_date).split('-').map(Number);
-    if (!shouldIncludeMonth(sYear, sMonth, targetYear, targetMonth, card.frequency)) continue;
-    const dueDate = buildMonthDueDate(targetYear, targetMonth, card.payment_day);
-    if (card.end_date && dueDate > card.end_date) continue;
+    if (!shouldIncludeMonth(sYear, sMonth, targetYear, targetMonth, String(card.frequency))) {
+      continue;
+    }
+    const dueDate = buildMonthDueDate(targetYear, targetMonth, Number(card.payment_day));
+    if (card.end_date && dueDate > String(card.end_date)) continue;
 
-    await db
-      .from('recurring_expense_periods')
-      .upsert(
-        {
-          business_id: ctx.business.id,
-          recurring_expense_id: card.id,
-          period_year: targetYear,
-          period_month: targetMonth,
-          due_date: dueDate,
-          planned_amount: roundCurrency(card.monthly_amount),
-          status: 'pending',
-        },
-        { onConflict: 'recurring_expense_id,period_year,period_month', ignoreDuplicates: true }
-      );
+    await execute(
+      `INSERT IGNORE INTO recurring_expense_periods
+       (id, business_id, recurring_expense_id, period_year, period_month, due_date, planned_amount, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [
+        uuid(),
+        ctx.business.id,
+        String(card.id),
+        targetYear,
+        targetMonth,
+        dueDate,
+        roundCurrency(Number(card.monthly_amount)),
+      ]
+    );
   }
 
-  const [{ data: periods }, { data: allPeriods }] = await Promise.all([
-    db
-      .from('recurring_expense_periods')
-      .select('*, recurring_expense:recurring_expenses(*)')
-      .eq('business_id', ctx.business.id)
-      .eq('period_year', targetYear)
-      .eq('period_month', targetMonth)
-      .order('due_date', { ascending: true }),
-    db
-      .from('recurring_expense_periods')
-      .select('*, recurring_expense:recurring_expenses(title, category)')
-      .eq('business_id', ctx.business.id)
-      .eq('status', 'paid')
-      .order('paid_date', { ascending: false })
-      .limit(30),
+  const [periods, allPeriods] = await Promise.all([
+    query<Record<string, unknown>>(
+      `SELECT p.*, r.title AS r_title, r.category AS r_category, r.monthly_amount AS r_monthly_amount,
+              r.payment_day AS r_payment_day, r.frequency AS r_frequency
+       FROM recurring_expense_periods p
+       LEFT JOIN recurring_expenses r ON r.id = p.recurring_expense_id
+       WHERE p.business_id = ? AND p.period_year = ? AND p.period_month = ?
+       ORDER BY p.due_date ASC`,
+      [ctx.business.id, targetYear, targetMonth]
+    ),
+    query<Record<string, unknown>>(
+      `SELECT p.*, r.title AS r_title, r.category AS r_category
+       FROM recurring_expense_periods p
+       LEFT JOIN recurring_expenses r ON r.id = p.recurring_expense_id
+       WHERE p.business_id = ? AND p.status = 'paid'
+       ORDER BY p.paid_date DESC
+       LIMIT 30`,
+      [ctx.business.id]
+    ),
   ]);
 
   const plannedMonthlyTotal = roundCurrency(
-    (cards ?? [])
-      .filter((c) => c.is_active)
+    cards
+      .filter((c) => toBool(c.is_active))
       .reduce((acc, c) => acc + Number(c.monthly_amount), 0)
   );
 
   return NextResponse.json({
-    cards: cards ?? [],
-    periods: periods ?? [],
-    paidHistory: allPeriods ?? [],
+    cards: cards.map((c) => ({
+      ...c,
+      monthly_amount: Number(c.monthly_amount),
+      is_active: toBool(c.is_active),
+    })),
+    periods: periods.map((p) => ({
+      ...p,
+      planned_amount: Number(p.planned_amount),
+      paid_amount: p.paid_amount != null ? Number(p.paid_amount) : null,
+      recurring_expense: {
+        id: p.recurring_expense_id,
+        title: p.r_title,
+        category: p.r_category,
+        monthly_amount: Number(p.r_monthly_amount ?? p.planned_amount),
+        payment_day: Number(p.r_payment_day ?? 1),
+        frequency: p.r_frequency ?? 'monthly',
+      },
+    })),
+    paidHistory: allPeriods.map((p) => ({
+      ...p,
+      planned_amount: Number(p.planned_amount),
+      paid_amount: p.paid_amount != null ? Number(p.paid_amount) : null,
+      recurring_expense: {
+        title: p.r_title,
+        category: p.r_category,
+      },
+    })),
     plannedMonthlyTotal,
     targetYear,
     targetMonth,
@@ -135,8 +169,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessContext('recurring.create');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('recurring.create');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -155,51 +189,53 @@ export async function POST(req: NextRequest) {
 
   const d = parsed.data;
   const amount = roundCurrency(d.monthlyAmount);
+  const id = uuid();
+  const nowStr = toMySqlDateTime();
 
-  const { data: card, error: insertErr } = await db
-    .from('recurring_expenses')
-    .insert({
-      business_id: ctx.business.id,
-      category: d.category,
-      title: d.title,
-      monthly_amount: amount,
-      start_date: d.startDate,
-      end_date: d.endDate || null,
-      payment_day: d.paymentDay,
-      frequency: d.frequency,
-      description: d.description,
-      is_active: true,
-      created_by: ctx.userId,
-    })
-    .select('*')
-    .single();
+  await execute(
+    `INSERT INTO recurring_expenses
+     (id, business_id, category, title, monthly_amount, start_date, end_date, payment_day, frequency, description, is_active, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+    [
+      id,
+      ctx.business.id,
+      d.category,
+      d.title,
+      amount,
+      d.startDate,
+      d.endDate || null,
+      d.paymentDay,
+      d.frequency,
+      d.description,
+      ctx.userId,
+      nowStr,
+      nowStr,
+    ]
+  );
 
-  if (insertErr || !card) {
-    return NextResponse.json({ error: insertErr?.message ?? 'Sabit gider kartı oluşturulamadı.' }, { status: 500 });
-  }
-
-  // Başlangıç ayından itibaren geçerli ay için dönem planı oluştur
   const { year: curYear, month: curMonth } = getIstanbulMonthBounds();
   const [sYear, sMonth] = d.startDate.split('-').map(Number);
   if (shouldIncludeMonth(sYear, sMonth, curYear, curMonth, d.frequency)) {
     const dueDate = buildMonthDueDate(curYear, curMonth, d.paymentDay);
     if (!d.endDate || dueDate <= d.endDate) {
-      await db.from('recurring_expense_periods').upsert(
-        {
-          business_id: ctx.business.id,
-          recurring_expense_id: card.id,
-          period_year: curYear,
-          period_month: curMonth,
-          due_date: dueDate,
-          planned_amount: amount,
-          status: 'pending',
-        },
-        { onConflict: 'recurring_expense_id,period_year,period_month', ignoreDuplicates: true }
+      await execute(
+        `INSERT IGNORE INTO recurring_expense_periods
+         (id, business_id, recurring_expense_id, period_year, period_month, due_date, planned_amount, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`,
+        [uuid(), ctx.business.id, id, curYear, curMonth, dueDate, amount]
       );
     }
   }
 
-  return NextResponse.json({ card }, { status: 201 });
+  const card = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM recurring_expenses WHERE id = ? LIMIT 1',
+    [id]
+  );
+
+  return NextResponse.json(
+    { card: card ? { ...card, is_active: toBool(card.is_active) } : null },
+    { status: 201 }
+  );
 }
 
 export async function PATCH(req: NextRequest) {
@@ -219,62 +255,119 @@ export async function PATCH(req: NextRequest) {
   }
 
   const payload = parsed.data;
+  const nowStr = toMySqlDateTime();
+
   if (payload.action === 'pay_period') {
-    const { error, ctx, db } = await requireBusinessContext('recurring.pay');
-    if (error || !ctx || !db || !ctx.business) return error!;
+    const { error, ctx } = await requireBusinessContext('recurring.pay');
+    if (error || !ctx || !ctx.business) return error!;
 
-    const { data: rpcRes, error: rpcErr } = await db.rpc('pay_recurring_expense_period', {
-      p_period_id: payload.periodId,
-      p_business_id: ctx.business.id,
-      p_user_id: ctx.userId,
-      p_paid_amount: roundCurrency(payload.paidAmount),
-      p_paid_date: payload.paidDate,
-      p_payment_method: payload.paymentMethod,
-    });
+    const paidAmount = roundCurrency(payload.paidAmount);
+    try {
+      const expenseId = await withTransaction(async (conn) => {
+        const [rows] = await conn.execute(
+          `SELECT p.*, r.title AS r_title, r.category AS r_category
+           FROM recurring_expense_periods p
+           LEFT JOIN recurring_expenses r ON r.id = p.recurring_expense_id
+           WHERE p.id = ? AND p.business_id = ?
+           FOR UPDATE`,
+          [payload.periodId, ctx.business!.id]
+        );
+        const period = (rows as Array<Record<string, unknown>>)[0];
+        if (!period) {
+          throw new Error('NOT_FOUND:Sabit gider dönemi bulunamadı.');
+        }
+        if (period.status === 'paid') {
+          throw new Error('CONFLICT:Bu dönem zaten ödenmiş olarak işaretlenmiş.');
+        }
 
-    if (rpcErr) {
-      return NextResponse.json({ error: rpcErr.message }, { status: 409 });
+        const expId = uuid();
+        await conn.execute(
+          `INSERT INTO expense_transactions
+           (id, business_id, category_id, category_name, title, amount, transaction_date, payment_method, description, is_cancelled, created_by, created_at, updated_at)
+           VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+          [
+            expId,
+            ctx.business!.id,
+            String(period.r_category || 'Sabit Gider'),
+            `${String(period.r_title || 'Sabit Gider')} (${period.period_month}/${period.period_year})`,
+            paidAmount,
+            payload.paidDate,
+            payload.paymentMethod,
+            'Aylık sabit gider ödemesi',
+            ctx.userId,
+            nowStr,
+            nowStr,
+          ]
+        );
+
+        await conn.execute(
+          `UPDATE recurring_expense_periods
+           SET status = 'paid', paid_amount = ?, paid_date = ?, payment_method = ?, expense_transaction_id = ?, updated_at = ?
+           WHERE id = ?`,
+          [paidAmount, payload.paidDate, payload.paymentMethod, expId, nowStr, payload.periodId]
+        );
+
+        return expId;
+      });
+
+      return NextResponse.json({ success: true, expenseTransactionId: expenseId });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Ödeme kaydedilemedi.';
+      if (msg.startsWith('NOT_FOUND:')) return NextResponse.json({ error: msg.slice(10) }, { status: 404 });
+      if (msg.startsWith('CONFLICT:')) return NextResponse.json({ error: msg.slice(9) }, { status: 409 });
+      return NextResponse.json({ error: msg }, { status: 500 });
     }
-
-    return NextResponse.json({ success: true, result: rpcRes });
   }
 
-  const { error, ctx, db } = await requireBusinessContext('recurring.edit');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('recurring.edit');
+  if (error || !ctx || !ctx.business) return error!;
 
-  const updateFields: Record<string, unknown> = { updated_at: new Date().toISOString() };
-  if (payload.category !== undefined) updateFields.category = payload.category;
-  if (payload.title !== undefined) updateFields.title = payload.title;
-  if (payload.monthlyAmount !== undefined) updateFields.monthly_amount = roundCurrency(payload.monthlyAmount);
-  if (payload.paymentDay !== undefined) updateFields.payment_day = payload.paymentDay;
-  if (payload.endDate !== undefined) updateFields.end_date = payload.endDate || null;
-  if (payload.description !== undefined) updateFields.description = payload.description;
-  if (payload.isActive !== undefined) updateFields.is_active = payload.isActive;
-
-  const { data: updated, error: updErr } = await db
-    .from('recurring_expenses')
-    .update(updateFields)
-    .eq('id', payload.id)
-    .eq('business_id', ctx.business.id)
-    .select('*')
-    .maybeSingle();
-
-  if (updErr || !updated) {
-    return NextResponse.json({ error: updErr?.message ?? 'Sabit gider güncellenemedi.' }, { status: 400 });
+  const existing = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM recurring_expenses WHERE id = ? AND business_id = ? LIMIT 1',
+    [payload.id, ctx.business.id]
+  );
+  if (!existing) {
+    return NextResponse.json({ error: 'Sabit gider kartı bulunamadı.' }, { status: 404 });
   }
 
-  // Yalnızca ödenmemiş (pending) dönemlerin plan tutarını güncelle; ödenmiş eski dönemlere ASLA dokunma!
+  const nextAmount =
+    payload.monthlyAmount !== undefined
+      ? roundCurrency(payload.monthlyAmount)
+      : Number(existing.monthly_amount);
+
+  await execute(
+    `UPDATE recurring_expenses
+     SET category = ?, title = ?, monthly_amount = ?, payment_day = ?, end_date = ?, description = ?, is_active = ?, updated_at = ?
+     WHERE id = ? AND business_id = ?`,
+    [
+      payload.category ?? String(existing.category),
+      payload.title ?? String(existing.title),
+      nextAmount,
+      payload.paymentDay ?? Number(existing.payment_day),
+      payload.endDate !== undefined ? payload.endDate : existing.end_date,
+      payload.description ?? String(existing.description ?? ''),
+      payload.isActive !== undefined ? (payload.isActive ? 1 : 0) : toBool(existing.is_active) ? 1 : 0,
+      nowStr,
+      payload.id,
+      ctx.business.id,
+    ]
+  );
+
   if (payload.monthlyAmount !== undefined) {
-    await db
-      .from('recurring_expense_periods')
-      .update({
-        planned_amount: roundCurrency(payload.monthlyAmount),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('recurring_expense_id', payload.id)
-      .eq('business_id', ctx.business.id)
-      .eq('status', 'pending');
+    await execute(
+      `UPDATE recurring_expense_periods
+       SET planned_amount = ?, updated_at = ?
+       WHERE recurring_expense_id = ? AND business_id = ? AND status = 'pending'`,
+      [nextAmount, nowStr, payload.id, ctx.business.id]
+    );
   }
 
-  return NextResponse.json({ card: updated });
+  const updated = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM recurring_expenses WHERE id = ? LIMIT 1',
+    [payload.id]
+  );
+
+  return NextResponse.json({
+    card: updated ? { ...updated, is_active: toBool(updated.is_active) } : null,
+  });
 }

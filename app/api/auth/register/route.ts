@@ -1,6 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { createServiceRoleSupabase, isServiceRoleConfigured } from '@/lib/supabase/server';
+import { hashPassword, setSessionCookie } from '@/lib/auth-mysql';
+import {
+  isDatabaseConfigured,
+  queryOne,
+  toBool,
+  toMySqlDateTime,
+  uuid,
+  withTransaction,
+  writeAuditLog,
+} from '@/lib/db';
 import { ALL_PERMISSION_CODES } from '@/lib/permissions';
 
 const registerSchema = z
@@ -35,11 +44,11 @@ function generateBusinessCode(): string {
 }
 
 export async function POST(req: NextRequest) {
-  if (!isServiceRoleConfigured()) {
+  if (!isDatabaseConfigured()) {
     return NextResponse.json(
       {
         error:
-          'Veritabanı bağlantısı henüz yapılandırılmamış. Lütfen Supabase ortam değişkenlerini tanımlayın.',
+          'MySQL veritabanı bağlantısı henüz yapılandırılmamış. Lütfen ortam değişkenlerini kontrol ediniz.',
       },
       { status: 503 }
     );
@@ -61,15 +70,11 @@ export async function POST(req: NextRequest) {
   }
 
   const data = parsed.data;
-  const db = createServiceRoleSupabase()!;
 
-  // Aynı e-posta ile ikinci hesap oluşturulmasını engelle
-  const { data: existingProfile } = await db
-    .from('profiles')
-    .select('id')
-    .eq('email', data.email)
-    .maybeSingle();
-
+  const existingProfile = await queryOne<{ id: string }>(
+    'SELECT id FROM profiles WHERE email = ? LIMIT 1',
+    [data.email]
+  );
   if (existingProfile) {
     return NextResponse.json(
       { error: 'Bu e-posta adresi ile zaten kayıtlı bir hesap bulunmaktadır.' },
@@ -77,143 +82,125 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // Tek aktif abonelik paketini al
-  const { data: plan, error: planErr } = await db
-    .from('subscription_plans')
-    .select('*')
-    .limit(1)
-    .maybeSingle();
-
-  if (planErr || !plan) {
+  const existingAdmin = await queryOne<{ user_id: string }>(
+    'SELECT user_id FROM system_admins WHERE email = ? LIMIT 1',
+    [data.email]
+  );
+  if (existingAdmin) {
     return NextResponse.json(
-      { error: 'Sistemde tanımlı abonelik paketi bulunamadı. Lütfen yönetici ile iletişime geçin.' },
-      { status: 500 }
+      { error: 'Bu e-posta adresi sistem yöneticisi olarak kullanılmaktadır.' },
+      { status: 409 }
     );
   }
 
-  // 1. Supabase Auth kullanıcısı oluştur
-  const { data: authData, error: authError } = await db.auth.admin.createUser({
-    email: data.email,
-    password: data.password,
-    email_confirm: true,
-    user_metadata: {
-      first_name: data.firstName,
-      last_name: data.lastName,
-      phone: data.phone,
-    },
-  });
+  const plan = await queryOne<{
+    id: string;
+    name: string;
+    monthly_price: number;
+    duration_days: number;
+  }>('SELECT id, name, monthly_price, duration_days FROM subscription_plans LIMIT 1');
 
-  if (authError || !authData.user) {
-    const msg = authError?.message?.toLowerCase().includes('already')
-      ? 'Bu e-posta adresi ile zaten bir kullanıcı mevcut.'
-      : authError?.message ?? 'Kullanıcı hesabı oluşturulamadı.';
-    return NextResponse.json({ error: msg }, { status: 400 });
-  }
+  const userId = uuid();
+  const businessId = uuid();
+  const memberId = uuid();
+  const subId = uuid();
+  const businessCode = generateBusinessCode();
+  const passwordHash = hashPassword(data.password);
+  const nowStr = toMySqlDateTime();
 
-  const userId = authData.user.id;
+  const sysCfg = await queryOne<{ booking_module_default_included: number }>(
+    'SELECT booking_module_default_included FROM system_settings WHERE id = 1 LIMIT 1'
+  );
+  const bookingIncluded = sysCfg ? toBool(sysCfg.booking_module_default_included) : true;
 
-  try {
-    // 2. Profil kaydını garanti et
-    await db.from('profiles').upsert({
-      id: userId,
-      first_name: data.firstName,
-      last_name: data.lastName,
-      phone: data.phone,
-      email: data.email,
-      email_verified: false,
-      phone_verified: false,
-    });
+  await withTransaction(async (conn) => {
+    await conn.execute(
+      `INSERT INTO profiles (id, first_name, last_name, phone, email, password_hash, email_verified, phone_verified, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)`,
+      [userId, data.firstName, data.lastName, data.phone, data.email, passwordHash, nowStr, nowStr]
+    );
 
-    // 3. İşletme kaydı oluştur (Ödeme Bekliyor)
-    const { data: sysCfg } = await db
-      .from('system_settings')
-      .select('booking_module_default_included')
-      .eq('id', 1)
-      .maybeSingle();
-    const bookingIncluded = sysCfg?.booking_module_default_included !== false;
+    await conn.execute(
+      `INSERT INTO businesses (id, name, business_code, owner_id, phone, email, address, subscription_status, is_active, booking_module_enabled, booking_module_mode, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, '', 'payment_pending', 1, ?, ?, ?, ?)`,
+      [
+        businessId,
+        data.businessName,
+        businessCode,
+        userId,
+        data.phone,
+        data.email,
+        bookingIncluded ? 1 : 0,
+        bookingIncluded ? 'included' : 'addon_locked',
+        nowStr,
+        nowStr,
+      ]
+    );
 
-    const businessCode = generateBusinessCode();
-    const { data: business, error: bizErr } = await db
-      .from('businesses')
-      .insert({
-        name: data.businessName,
-        business_code: businessCode,
-        owner_id: userId,
-        phone: data.phone,
-        email: data.email,
-        subscription_status: 'payment_pending',
-        is_active: true,
-        booking_module_enabled: bookingIncluded,
-        booking_module_mode: bookingIncluded ? 'included' : 'addon_locked',
-      })
-      .select('*')
-      .single();
+    await conn.execute(
+      `INSERT INTO business_members (id, business_id, user_id, role_name, is_owner, is_active, permissions, created_at)
+       VALUES (?, ?, ?, 'İşletme Sahibi', 1, 1, ?, ?)`,
+      [memberId, businessId, userId, JSON.stringify(ALL_PERMISSION_CODES), nowStr]
+    );
 
-    if (bizErr || !business) {
-      throw new Error(bizErr?.message ?? 'İşletme kaydı oluşturulamadı.');
+    await conn.execute(
+      `INSERT INTO subscriptions (id, business_id, plan_id, plan_name, monthly_price, duration_days, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'payment_pending', ?)`,
+      [
+        subId,
+        businessId,
+        plan?.id ?? null,
+        plan?.name ?? 'EsnafTakip İşletme Aboneliği',
+        Number(plan?.monthly_price ?? 490),
+        Number(plan?.duration_days ?? 30),
+        nowStr,
+      ]
+    );
+
+    const expCats = ['Elektrik', 'Su', 'Personel', 'Kira', 'Nakliye', 'Diğer'];
+    for (const c of expCats) {
+      await conn.execute(
+        'INSERT INTO expense_categories (id, business_id, name, is_active) VALUES (?, ?, ?, 1)',
+        [uuid(), businessId, c]
+      );
     }
 
-    // 4. İşletme sahibi üyeliği (tam yetki)
-    const { error: memberErr } = await db.from('business_members').insert({
-      business_id: business.id,
-      user_id: userId,
-      role_name: 'İşletme Sahibi',
-      is_owner: true,
-      is_active: true,
-      permissions: ALL_PERMISSION_CODES,
-    });
-    if (memberErr) throw new Error(memberErr.message);
+    const incCats = ['Peşin Satış', 'Hizmet Geliri', 'Online Randevu', 'Diğer'];
+    for (const c of incCats) {
+      await conn.execute(
+        'INSERT INTO income_categories (id, business_id, name, is_active) VALUES (?, ?, ?, 1)',
+        [uuid(), businessId, c]
+      );
+    }
+  });
 
-    // 5. Abonelik kaydı
-    const { error: subErr } = await db.from('subscriptions').insert({
-      business_id: business.id,
-      plan_id: plan.id,
-      status: 'payment_pending',
-      locked_price: plan.monthly_price,
-    });
-    if (subErr) throw new Error(subErr.message);
+  await writeAuditLog({
+    scope: 'business',
+    businessId,
+    actorUserId: userId,
+    actorName: `${data.firstName} ${data.lastName}`,
+    action: 'business_registered',
+    entityType: 'businesses',
+    entityId: businessId,
+    newValues: { name: data.businessName, status: 'payment_pending' },
+    description: 'Yeni işletme başvurusu oluşturuldu.',
+  });
 
-    // 6. Varsayılan gelir ve gider kategorileri
-    await db.from('expense_categories').insert([
-      { business_id: business.id, name: 'Elektrik', is_default: true },
-      { business_id: business.id, name: 'Su', is_default: true },
-      { business_id: business.id, name: 'Personel', is_default: true },
-      { business_id: business.id, name: 'Kira', is_default: true },
-      { business_id: business.id, name: 'Nakliye', is_default: true },
-      { business_id: business.id, name: 'Diğer', is_default: true },
-    ]);
+  const res = NextResponse.json(
+    {
+      success: true,
+      businessId,
+      businessCode,
+      message: 'Başvurunuz alındı. Ödeme ekranına yönlendiriliyorsunuz.',
+    },
+    { status: 201 }
+  );
 
-    await db.from('income_categories').insert([
-      { business_id: business.id, name: 'Peşin Satış', is_default: true },
-      { business_id: business.id, name: 'Hizmet Geliri', is_default: true },
-      { business_id: business.id, name: 'Diğer', is_default: true },
-    ]);
+  setSessionCookie(res, {
+    userId,
+    email: data.email,
+    role: 'business',
+  });
 
-    await db.from('audit_logs').insert({
-      scope: 'business',
-      business_id: business.id,
-      actor_user_id: userId,
-      actor_name: `${data.firstName} ${data.lastName}`,
-      action: 'business_registered',
-      entity_type: 'businesses',
-      entity_id: business.id,
-      new_values: { name: data.businessName, status: 'payment_pending' },
-      description: 'Yeni işletme başvurusu oluşturuldu.',
-    });
-
-    return NextResponse.json(
-      {
-        success: true,
-        businessId: business.id,
-        businessCode: business.business_code,
-        message: 'Başvurunuz alındı. Ödeme ekranına yönlendiriliyorsunuz.',
-      },
-      { status: 201 }
-    );
-  } catch (err) {
-    // Geri alma: auth kullanıcısını temizle
-    await db.auth.admin.deleteUser(userId);
-    const message = err instanceof Error ? err.message : 'Başvuru işlemi tamamlanamadı.';
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
+  return res;
 }

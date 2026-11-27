@@ -1,6 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireSystemAdmin } from '@/lib/auth-server';
+import {
+  parseJsonField,
+  query,
+  toIsoString,
+  toMySqlDateTime,
+  uuid,
+  withTransaction,
+  writeAuditLog,
+} from '@/lib/db';
 
 const reviewSchema = z.discriminatedUnion('action', [
   z.object({
@@ -17,21 +26,46 @@ const reviewSchema = z.discriminatedUnion('action', [
 ]);
 
 export async function GET() {
-  const { error, db } = await requireSystemAdmin();
-  if (error || !db) return error!;
+  const { error } = await requireSystemAdmin();
+  if (error) return error;
 
-  const { data: requests, error: err } = await db
-    .from('payment_requests')
-    .select('*, businesses(name, business_code, email, phone), plan:subscription_plans(name, monthly_price)')
-    .order('created_at', { ascending: false });
+  const rows = await query<Record<string, unknown>>(
+    `SELECT pr.*, b.name AS b_name, b.business_code AS b_code, b.email AS b_email, b.phone AS b_phone,
+            sp.name AS sp_name, sp.monthly_price AS sp_price
+     FROM payment_requests pr
+     LEFT JOIN businesses b ON b.id = pr.business_id
+     LEFT JOIN subscription_plans sp ON sp.id = pr.plan_id
+     ORDER BY pr.created_at DESC`
+  );
 
-  if (err) return NextResponse.json({ error: err.message }, { status: 500 });
-  return NextResponse.json({ requests: requests ?? [] });
+  const requests = rows.map((r) => ({
+    ...r,
+    amount: Number(r.amount ?? 0),
+    bank_snapshot: parseJsonField(r.bank_snapshot, {}),
+    created_at: toIsoString(r.created_at),
+    reviewed_at: toIsoString(r.reviewed_at),
+    businesses: r.b_name
+      ? {
+          name: r.b_name,
+          business_code: r.b_code,
+          email: r.b_email,
+          phone: r.b_phone,
+        }
+      : undefined,
+    plan: r.sp_name
+      ? {
+          name: r.sp_name,
+          monthly_price: Number(r.sp_price ?? 0),
+        }
+      : undefined,
+  }));
+
+  return NextResponse.json({ requests });
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireSystemAdmin();
-  if (error || !ctx || !db) return error!;
+  const { error, ctx } = await requireSystemAdmin();
+  if (error || !ctx) return error!;
 
   let body: unknown;
   try {
@@ -49,82 +83,113 @@ export async function PATCH(req: NextRequest) {
   }
 
   const payload = parsed.data;
+  const nowStr = toMySqlDateTime();
 
-  if (payload.action === 'approve') {
-    const startISO = `${payload.startDate}T00:00:00+03:00`;
-    const endISO = `${payload.endDate}T23:59:59+03:00`;
+  try {
+    await withTransaction(async (conn) => {
+      const [rows] = await conn.execute(
+        'SELECT * FROM payment_requests WHERE id = ? FOR UPDATE',
+        [payload.requestId]
+      );
+      const reqRow = (rows as Array<Record<string, unknown>>)[0];
+      if (!reqRow) {
+        throw new Error('NOT_FOUND:Ödeme talebi bulunamadı.');
+      }
+      if (reqRow.status !== 'pending') {
+        throw new Error('CONFLICT:Bu ödeme talebi zaten sonuçlandırılmış.');
+      }
 
-    const { data: rpcRes, error: rpcErr } = await db.rpc('admin_approve_payment_request', {
-      p_request_id: payload.requestId,
-      p_admin_id: ctx.userId,
-      p_start_at: startISO,
-      p_end_at: endISO,
+      const businessId = String(reqRow.business_id);
+
+      if (payload.action === 'approve') {
+        const startSql = `${payload.startDate} 00:00:00.000`;
+        const endSql = `${payload.endDate} 23:59:59.000`;
+
+        await conn.execute(
+          `UPDATE payment_requests
+           SET status = 'approved', reviewed_by = ?, reviewed_at = ?
+           WHERE id = ?`,
+          [ctx.userId, nowStr, payload.requestId]
+        );
+
+        await conn.execute(
+          `UPDATE businesses
+           SET subscription_status = 'active', is_active = 1,
+               subscription_start_at = ?, subscription_end_at = ?, updated_at = ?
+           WHERE id = ?`,
+          [startSql, endSql, nowStr, businessId]
+        );
+
+        await conn.execute(
+          `UPDATE subscriptions
+           SET status = 'active', start_at = ?, end_at = ?
+           WHERE business_id = ?`,
+          [startSql, endSql, businessId]
+        );
+
+        await conn.execute(
+          `INSERT INTO notifications (id, business_id, recipient_user_id, type, title, message, link, is_read, created_at)
+           VALUES (?, ?, NULL, 'payment_approved', 'Aboneliğiniz Aktif Edildi', ?, '/panel', 0, ?)`,
+          [
+            uuid(),
+            businessId,
+            `Ödeme talebiniz onaylandı. Aboneliğiniz ${payload.endDate} tarihine kadar aktiftir.`,
+            nowStr,
+          ]
+        );
+      } else {
+        await conn.execute(
+          `UPDATE payment_requests
+           SET status = 'rejected', rejected_reason = ?, reviewed_by = ?, reviewed_at = ?
+           WHERE id = ?`,
+          [payload.rejectedReason, ctx.userId, nowStr, payload.requestId]
+        );
+
+        await conn.execute(
+          `UPDATE businesses SET subscription_status = 'payment_pending', updated_at = ? WHERE id = ?`,
+          [nowStr, businessId]
+        );
+
+        await conn.execute(
+          `UPDATE subscriptions SET status = 'payment_pending' WHERE business_id = ?`,
+          [businessId]
+        );
+
+        await conn.execute(
+          `INSERT INTO notifications (id, business_id, recipient_user_id, type, title, message, link, is_read, created_at)
+           VALUES (?, ?, NULL, 'payment_rejected', 'Ödeme Talebi Reddedildi', ?, '/odeme', 0, ?)`,
+          [
+            uuid(),
+            businessId,
+            `Ödeme bildiriminiz reddedildi. Sebep: ${payload.rejectedReason}`,
+            nowStr,
+          ]
+        );
+      }
     });
-
-    if (rpcErr) {
-      return NextResponse.json({ error: rpcErr.message }, { status: 409 });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'İşlem başarısız.';
+    if (msg.startsWith('NOT_FOUND:')) {
+      return NextResponse.json({ error: msg.slice(10) }, { status: 404 });
     }
-
-    return NextResponse.json({ success: true, result: rpcRes });
+    if (msg.startsWith('CONFLICT:')) {
+      return NextResponse.json({ error: msg.slice(9) }, { status: 409 });
+    }
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 
-  // Reddetme
-  const { data: reqRow } = await db
-    .from('payment_requests')
-    .select('*')
-    .eq('id', payload.requestId)
-    .maybeSingle();
-
-  if (!reqRow) {
-    return NextResponse.json({ error: 'Ödeme talebi bulunamadı.' }, { status: 404 });
-  }
-
-  if (reqRow.status !== 'pending') {
-    return NextResponse.json(
-      { error: 'Bu ödeme talebi zaten sonuçlandırılmış.' },
-      { status: 409 }
-    );
-  }
-
-  await db
-    .from('payment_requests')
-    .update({
-      status: 'rejected',
-      rejected_reason: payload.rejectedReason,
-      reviewed_by: ctx.userId,
-      reviewed_at: new Date().toISOString(),
-    })
-    .eq('id', reqRow.id);
-
-  await db
-    .from('businesses')
-    .update({ subscription_status: 'payment_pending', updated_at: new Date().toISOString() })
-    .eq('id', reqRow.business_id);
-
-  await db
-    .from('subscriptions')
-    .update({ status: 'payment_pending', updated_at: new Date().toISOString() })
-    .eq('business_id', reqRow.business_id);
-
-  await db.from('notifications').insert({
-    business_id: reqRow.business_id,
-    type: 'payment_rejected',
-    title: 'Ödeme Talebi Reddedildi',
-    message: `Ödeme bildiriminiz reddedildi. Sebep: ${payload.rejectedReason}`,
-    link: '/odeme',
-  });
-
-  await db.from('audit_logs').insert({
+  await writeAuditLog({
     scope: 'admin',
-    business_id: reqRow.business_id,
-    actor_user_id: ctx.userId,
-    actor_name: ctx.adminName ?? 'Sistem Yöneticisi',
-    action: 'payment_rejected',
-    entity_type: 'payment_requests',
-    entity_id: reqRow.id,
-    old_values: { status: 'pending' },
-    new_values: { status: 'rejected', rejected_reason: payload.rejectedReason },
-    description: `Ödeme talebi reddedildi: ${payload.rejectedReason}`,
+    actorUserId: ctx.userId,
+    actorName: ctx.adminName ?? 'Sistem Yöneticisi',
+    action: payload.action === 'approve' ? 'payment_approved' : 'payment_rejected',
+    entityType: 'payment_requests',
+    entityId: payload.requestId,
+    newValues: payload,
+    description:
+      payload.action === 'approve'
+        ? `Ödeme talebi onaylandı (${payload.startDate} - ${payload.endDate}).`
+        : `Ödeme talebi reddedildi: ${payload.rejectedReason}`,
   });
 
   return NextResponse.json({ success: true });

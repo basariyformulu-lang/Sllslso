@@ -1,10 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessBookingContext } from '@/lib/auth-server';
-import { roundCurrency, formatDateTR, getIstanbulTodayISO } from '@/lib/format';
-import { computeAvailableSlots } from '@/lib/booking-slots';
+import {
+  DEFAULT_BUSINESS_HOURS,
+  formatTimeHHMM,
+  normalizePhoneTR,
+} from '@/lib/booking-helpers';
+import {
+  createAppointmentAtomic,
+  ensureBookingPageMysql,
+  formatBookingPageRow,
+  recordAppointmentPaymentAtomic,
+  rescheduleAppointmentAtomic,
+} from '@/lib/booking-mysql';
 import { dispatchAppointmentNotifications } from '@/lib/booking-notifications';
-import { DEFAULT_BUSINESS_HOURS, formatTimeHHMM } from '@/lib/booking-helpers';
+import { computeAvailableSlots } from '@/lib/booking-slots';
+import { execute, query, queryOne, toBool, toIsoString, toMySqlDateTime, uuid } from '@/lib/db';
+import { formatDateTR, getIstanbulTodayISO, roundCurrency } from '@/lib/format';
+import type { StaffBreak, StaffLeave, StaffWorkingHour } from '@/lib/types';
 
 const createPanelAppointmentSchema = z.object({
   bookingCustomerId: z.string().uuid().optional().nullable(),
@@ -56,8 +69,8 @@ const patchAppointmentSchema = z.discriminatedUnion('action', [
 ]);
 
 export async function GET(req: NextRequest) {
-  const { error, ctx, db, readOnly } = await requireBusinessBookingContext('booking.view', true);
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx, readOnly } = await requireBusinessBookingContext('booking.view', true);
+  if (error || !ctx || !ctx.business) return error!;
 
   const businessId = ctx.business.id;
   const { searchParams } = new URL(req.url);
@@ -73,35 +86,56 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'Tarih ve hizmet seçimi gereklidir.' }, { status: 400 });
     }
 
-    const [
-      { data: page },
-      { data: service },
-      { data: allStaff },
-      { data: staffServices },
-      { data: wh },
-      { data: breaks },
-      { data: leaves },
-      { data: appts },
-    ] = await Promise.all([
-      db.from('booking_pages').select('*').eq('business_id', businessId).maybeSingle(),
-      db.from('booking_services').select('*').eq('id', serviceId).eq('business_id', businessId).maybeSingle(),
-      db.from('booking_staff').select('id, full_name, is_active').eq('business_id', businessId).eq('is_active', true),
-      db.from('staff_services').select('staff_id, service_id').eq('business_id', businessId),
-      db.from('staff_working_hours').select('*').eq('business_id', businessId),
-      db.from('staff_breaks').select('*').eq('business_id', businessId),
-      db.from('staff_leaves').select('*').eq('business_id', businessId).lte('start_date', dateISO).gte('end_date', dateISO),
-      db
-        .from('appointments')
-        .select('id, staff_id, start_time, end_time, status')
-        .eq('business_id', businessId)
-        .eq('appointment_date', dateISO)
-        .in('status', ['pending', 'confirmed', 'completed']),
-    ]);
+    const [pageRow, service, allStaff, staffServices, whRows, breaksRows, leavesRows, appts] =
+      await Promise.all([
+        queryOne<Record<string, unknown>>(
+          'SELECT * FROM booking_pages WHERE business_id = ? LIMIT 1',
+          [businessId]
+        ),
+        queryOne<Record<string, unknown>>(
+          'SELECT * FROM booking_services WHERE id = ? AND business_id = ? LIMIT 1',
+          [serviceId, businessId]
+        ),
+        query<{ id: string }>(
+          'SELECT id FROM booking_staff WHERE business_id = ? AND is_active = 1',
+          [businessId]
+        ),
+        query<{ staff_id: string; service_id: string }>(
+          'SELECT staff_id, service_id FROM staff_services WHERE business_id = ?',
+          [businessId]
+        ),
+        query<Record<string, unknown>>(
+          'SELECT * FROM staff_working_hours WHERE business_id = ?',
+          [businessId]
+        ),
+        query<Record<string, unknown>>(
+          'SELECT * FROM staff_breaks WHERE business_id = ?',
+          [businessId]
+        ),
+        query<Record<string, unknown>>(
+          'SELECT * FROM staff_leaves WHERE business_id = ? AND start_date <= ? AND end_date >= ?',
+          [businessId, dateISO, dateISO]
+        ),
+        query<{
+          id: string;
+          staff_id: string;
+          start_time: string;
+          end_time: string;
+          status: string;
+        }>(
+          `SELECT id, staff_id, start_time, end_time, status
+           FROM appointments
+           WHERE business_id = ? AND appointment_date = ?
+             AND status IN ('pending', 'confirmed', 'completed')`,
+          [businessId, dateISO]
+        ),
+      ]);
 
     if (!service) return NextResponse.json({ slots: [] });
 
-    let candidateStaffIds = (allStaff ?? []).map((s) => s.id);
-    const serviceMappings = (staffServices ?? []).filter((ss) => ss.service_id === serviceId);
+    const page = pageRow ? formatBookingPageRow(pageRow) : null;
+    let candidateStaffIds = allStaff.map((s) => s.id);
+    const serviceMappings = staffServices.filter((ss) => ss.service_id === serviceId);
     if (serviceMappings.length > 0) {
       const allowedSet = new Set(serviceMappings.map((m) => m.staff_id));
       candidateStaffIds = candidateStaffIds.filter((id) => allowedSet.has(id));
@@ -110,18 +144,47 @@ export async function GET(req: NextRequest) {
       candidateStaffIds = candidateStaffIds.filter((id) => id === staffId);
     }
 
+    const wh: StaffWorkingHour[] = whRows.map((w) => ({
+      id: String(w.id),
+      staff_id: String(w.staff_id),
+      day_of_week: Number(w.day_of_week),
+      is_working: toBool(w.is_working),
+      start_time: String(w.start_time).slice(0, 5),
+      end_time: String(w.end_time).slice(0, 5),
+    }));
+
+    const breaks: StaffBreak[] = breaksRows.map((b) => ({
+      id: String(b.id),
+      business_id: String(b.business_id),
+      staff_id: String(b.staff_id),
+      day_of_week: b.day_of_week !== null ? Number(b.day_of_week) : null,
+      title: String(b.title),
+      start_time: String(b.start_time).slice(0, 5),
+      end_time: String(b.end_time).slice(0, 5),
+    }));
+
+    const leaves: StaffLeave[] = leavesRows.map((l) => ({
+      id: String(l.id),
+      business_id: String(l.business_id),
+      staff_id: l.staff_id ? String(l.staff_id) : null,
+      start_date: String(l.start_date),
+      end_date: String(l.end_date),
+      reason: String(l.reason ?? ''),
+      created_at: toIsoString(l.created_at) ?? '',
+    }));
+
     const slots = computeAvailableSlots({
       dateISO,
-      serviceDurationMinutes: service.duration_minutes,
-      slotIntervalMinutes: page?.slot_interval_minutes ?? 15,
+      serviceDurationMinutes: Number(service.duration_minutes || 30),
+      slotIntervalMinutes: Math.max(30, page?.slot_interval_minutes ?? 30),
       minAdvanceMinutes: 0,
       maxAdvanceDays: 180,
       businessHours: page?.business_hours ?? DEFAULT_BUSINESS_HOURS,
       candidateStaffIds,
-      staffWorkingHours: wh ?? [],
-      staffBreaks: breaks ?? [],
-      staffLeaves: leaves ?? [],
-      existingAppointments: appts ?? [],
+      staffWorkingHours: wh,
+      staffBreaks: breaks,
+      staffLeaves: leaves,
+      existingAppointments: appts,
       ignoreAppointmentId,
       enforceAdvanceRules: false,
     });
@@ -132,51 +195,95 @@ export async function GET(req: NextRequest) {
   const startDate = searchParams.get('startDate');
   const endDate = searchParams.get('endDate');
 
-  let query = db
-    .from('appointments')
-    .select('*, customer:booking_customers(id, first_name, last_name, phone, email)')
-    .eq('business_id', businessId)
-    .order('appointment_date', { ascending: true })
-    .order('start_time', { ascending: true });
+  let apptSql = `SELECT a.*, bc.first_name AS c_first_name, bc.last_name AS c_last_name, bc.phone AS c_phone, bc.email AS c_email
+                 FROM appointments a
+                 LEFT JOIN booking_customers bc ON bc.id = a.booking_customer_id
+                 WHERE a.business_id = ?`;
+  const apptParams: unknown[] = [businessId];
+  if (startDate) {
+    apptSql += ' AND a.appointment_date >= ?';
+    apptParams.push(startDate);
+  }
+  if (endDate) {
+    apptSql += ' AND a.appointment_date <= ?';
+    apptParams.push(endDate);
+  }
+  apptSql += ' ORDER BY a.appointment_date ASC, a.start_time ASC';
 
-  if (startDate) query = query.gte('appointment_date', startDate);
-  if (endDate) query = query.lte('appointment_date', endDate);
+  const [appointments, services, staff, customers, payments] = await Promise.all([
+    query<Record<string, unknown>>(apptSql, apptParams),
+    query<Record<string, unknown>>(
+      'SELECT * FROM booking_services WHERE business_id = ? ORDER BY sort_order ASC',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM booking_staff WHERE business_id = ? ORDER BY sort_order ASC',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM booking_customers WHERE business_id = ? AND is_active = 1 ORDER BY first_name ASC',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM appointment_payments WHERE business_id = ? ORDER BY created_at DESC',
+      [businessId]
+    ),
+  ]);
 
-  const [{ data: appointments }, { data: services }, { data: staff }, { data: customers }, { data: payments }] =
-    await Promise.all([
-      query,
-      db.from('booking_services').select('*').eq('business_id', businessId).order('sort_order', { ascending: true }),
-      db.from('booking_staff').select('*').eq('business_id', businessId).order('sort_order', { ascending: true }),
-      db.from('booking_customers').select('*').eq('business_id', businessId).eq('is_active', true).order('first_name', { ascending: true }),
-      db.from('appointment_payments').select('*').eq('business_id', businessId).order('created_at', { ascending: false }),
-    ]);
-
-  const paymentMap = new Map<string, typeof payments>();
-  (payments ?? []).forEach((p) => {
-    const arr = paymentMap.get(p.appointment_id) ?? [];
-    arr.push(p);
-    paymentMap.set(p.appointment_id, arr);
+  const paymentMap = new Map<string, Record<string, unknown>[]>();
+  payments.forEach((p) => {
+    const k = String(p.appointment_id);
+    const arr = paymentMap.get(k) ?? [];
+    arr.push({
+      ...p,
+      amount: Number(p.amount),
+      created_at: toIsoString(p.created_at),
+    });
+    paymentMap.set(k, arr);
   });
 
-  const enrichedAppointments = (appointments ?? []).map((a) => ({
+  const enrichedAppointments = appointments.map((a) => ({
     ...a,
     service_price_snapshot: Number(a.service_price_snapshot),
     paid_amount: Number(a.paid_amount),
-    payments: paymentMap.get(a.id) ?? [],
+    start_at: toIsoString(a.start_at),
+    end_at: toIsoString(a.end_at),
+    created_at: toIsoString(a.created_at),
+    customer: a.c_first_name
+      ? {
+          id: a.booking_customer_id,
+          first_name: a.c_first_name,
+          last_name: a.c_last_name ?? '',
+          phone: a.c_phone ?? a.customer_phone ?? '',
+          email: a.c_email ?? '',
+        }
+      : {
+          id: a.booking_customer_id,
+          first_name: String(a.customer_name || 'Müşteri'),
+          last_name: '',
+          phone: String(a.customer_phone || ''),
+          email: '',
+        },
+    payments: paymentMap.get(String(a.id)) ?? [],
   }));
 
   return NextResponse.json({
     readOnly,
     appointments: enrichedAppointments,
-    services: services ?? [],
-    staff: staff ?? [],
-    customers: customers ?? [],
+    services: services.map((s) => ({
+      ...s,
+      price: Number(s.price),
+      discount_price: s.discount_price !== null ? Number(s.discount_price) : null,
+      is_active: toBool(s.is_active),
+    })),
+    staff: staff.map((st) => ({ ...st, is_active: toBool(st.is_active) })),
+    customers: customers.map((c) => ({ ...c, is_active: toBool(c.is_active) })),
   });
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.manage');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.manage');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -195,132 +302,194 @@ export async function POST(req: NextRequest) {
 
   const d = parsed.data;
   const businessId = ctx.business.id;
+  const nowStr = toMySqlDateTime();
 
-  // Müşteri seçimi veya hızlı yeni müşteri oluşturma
   let bookingCustomerId = d.bookingCustomerId ?? null;
-  let customerUserId: string | null = null;
+  let customerName = '';
+  let customerPhone = '';
 
   if (!bookingCustomerId) {
     if (!d.newCustomer) {
-      return NextResponse.json({ error: 'Müşteri seçiniz veya yeni müşteri bilgisi giriniz.' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'Müşteri seçiniz veya yeni müşteri bilgisi giriniz.' },
+        { status: 400 }
+      );
     }
-    const { data: createdCust, error: custErr } = await db
-      .from('booking_customers')
-      .insert({
-        business_id: businessId,
-        first_name: d.newCustomer.firstName,
-        last_name: d.newCustomer.lastName,
-        phone: d.newCustomer.phone,
-        email: d.newCustomer.email.toLowerCase(),
-      })
-      .select('id, customer_user_id')
-      .single();
-    if (custErr || !createdCust) {
-      return NextResponse.json({ error: custErr?.message ?? 'Müşteri oluşturulamadı.' }, { status: 500 });
-    }
-    bookingCustomerId = createdCust.id;
-    customerUserId = createdCust.customer_user_id;
+    const newId = uuid();
+    const norm = normalizePhoneTR(d.newCustomer.phone);
+    await execute(
+      `INSERT INTO booking_customers
+       (id, business_id, customer_user_id, first_name, last_name, phone, phone_normalized, email, notes, is_active, created_at, updated_at)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, ?, '', 1, ?, ?)`,
+      [
+        newId,
+        businessId,
+        d.newCustomer.firstName,
+        d.newCustomer.lastName,
+        d.newCustomer.phone,
+        norm,
+        d.newCustomer.email.toLowerCase(),
+        nowStr,
+        nowStr,
+      ]
+    );
+    bookingCustomerId = newId;
+    customerName = `${d.newCustomer.firstName} ${d.newCustomer.lastName}`.trim();
+    customerPhone = d.newCustomer.phone;
   } else {
-    const { data: custRow } = await db
-      .from('booking_customers')
-      .select('id, customer_user_id')
-      .eq('id', bookingCustomerId)
-      .eq('business_id', businessId)
-      .maybeSingle();
+    const custRow = await queryOne<Record<string, unknown>>(
+      'SELECT id, first_name, last_name, phone FROM booking_customers WHERE id = ? AND business_id = ? LIMIT 1',
+      [bookingCustomerId, businessId]
+    );
     if (!custRow) {
       return NextResponse.json({ error: 'Seçilen müşteri bulunamadı.' }, { status: 404 });
     }
-    customerUserId = custRow.customer_user_id;
+    customerName = `${String(custRow.first_name ?? '')} ${String(custRow.last_name ?? '')}`.trim();
+    customerPhone = String(custRow.phone ?? '');
   }
 
-  // Sayfa kaydı yoksa otomatik taslak oluştur
-  const { data: page } = await db
-    .from('booking_pages')
-    .select('id, slot_interval_minutes, business_hours')
-    .eq('business_id', businessId)
-    .maybeSingle();
+  const page = await ensureBookingPageMysql(ctx.business);
   if (!page) {
-    return NextResponse.json(
-      { error: 'Önce Randevu Sayfası Tasarımı veya Ayarları bölümünden sayfanızı kaydediniz.' },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: 'Randevu sayfası oluşturulamadı.' }, { status: 500 });
   }
 
   let candidateStaffIds: string[] = [];
   if (d.staffId === 'any') {
-    const [{ data: service }, { data: allStaff }, { data: staffServices }, { data: wh }, { data: breaks }, { data: leaves }, { data: appts }] =
+    const [service, allStaff, staffServices, whRows, breaksRows, leavesRows, appts] =
       await Promise.all([
-        db.from('booking_services').select('duration_minutes').eq('id', d.serviceId).eq('business_id', businessId).single(),
-        db.from('booking_staff').select('id').eq('business_id', businessId).eq('is_active', true),
-        db.from('staff_services').select('staff_id').eq('business_id', businessId).eq('service_id', d.serviceId),
-        db.from('staff_working_hours').select('*').eq('business_id', businessId),
-        db.from('staff_breaks').select('*').eq('business_id', businessId),
-        db.from('staff_leaves').select('*').eq('business_id', businessId).lte('start_date', d.appointmentDate).gte('end_date', d.appointmentDate),
-        db.from('appointments').select('id, staff_id, start_time, end_time, status').eq('business_id', businessId).eq('appointment_date', d.appointmentDate).in('status', ['pending', 'confirmed', 'completed']),
+        queryOne<{ duration_minutes: number }>(
+          'SELECT duration_minutes FROM booking_services WHERE id = ? AND business_id = ? LIMIT 1',
+          [d.serviceId, businessId]
+        ),
+        query<{ id: string }>(
+          'SELECT id FROM booking_staff WHERE business_id = ? AND is_active = 1',
+          [businessId]
+        ),
+        query<{ staff_id: string }>(
+          'SELECT staff_id FROM staff_services WHERE business_id = ? AND service_id = ?',
+          [businessId, d.serviceId]
+        ),
+        query<Record<string, unknown>>(
+          'SELECT * FROM staff_working_hours WHERE business_id = ?',
+          [businessId]
+        ),
+        query<Record<string, unknown>>(
+          'SELECT * FROM staff_breaks WHERE business_id = ?',
+          [businessId]
+        ),
+        query<Record<string, unknown>>(
+          'SELECT * FROM staff_leaves WHERE business_id = ? AND start_date <= ? AND end_date >= ?',
+          [businessId, d.appointmentDate, d.appointmentDate]
+        ),
+        query<{
+          id: string;
+          staff_id: string;
+          start_time: string;
+          end_time: string;
+          status: string;
+        }>(
+          `SELECT id, staff_id, start_time, end_time, status
+           FROM appointments
+           WHERE business_id = ? AND appointment_date = ?
+             AND status IN ('pending', 'confirmed', 'completed')`,
+          [businessId, d.appointmentDate]
+        ),
       ]);
 
-    let pool = (allStaff ?? []).map((s) => s.id);
-    if ((staffServices ?? []).length > 0) {
-      const allowed = new Set((staffServices ?? []).map((ss) => ss.staff_id));
+    let pool = allStaff.map((s) => s.id);
+    if (staffServices.length > 0) {
+      const allowed = new Set(staffServices.map((ss) => ss.staff_id));
       pool = pool.filter((id) => allowed.has(id));
     }
 
+    const wh: StaffWorkingHour[] = whRows.map((w) => ({
+      id: String(w.id),
+      staff_id: String(w.staff_id),
+      day_of_week: Number(w.day_of_week),
+      is_working: toBool(w.is_working),
+      start_time: String(w.start_time).slice(0, 5),
+      end_time: String(w.end_time).slice(0, 5),
+    }));
+
+    const breaks: StaffBreak[] = breaksRows.map((b) => ({
+      id: String(b.id),
+      business_id: String(b.business_id),
+      staff_id: String(b.staff_id),
+      day_of_week: b.day_of_week !== null ? Number(b.day_of_week) : null,
+      title: String(b.title),
+      start_time: String(b.start_time).slice(0, 5),
+      end_time: String(b.end_time).slice(0, 5),
+    }));
+
+    const leaves: StaffLeave[] = leavesRows.map((l) => ({
+      id: String(l.id),
+      business_id: String(l.business_id),
+      staff_id: l.staff_id ? String(l.staff_id) : null,
+      start_date: String(l.start_date),
+      end_date: String(l.end_date),
+      reason: String(l.reason ?? ''),
+      created_at: toIsoString(l.created_at) ?? '',
+    }));
+
     const slots = computeAvailableSlots({
       dateISO: d.appointmentDate,
-      serviceDurationMinutes: service?.duration_minutes ?? 30,
-      slotIntervalMinutes: page.slot_interval_minutes ?? 15,
+      serviceDurationMinutes: Number(service?.duration_minutes ?? 30),
+      slotIntervalMinutes: Math.max(30, page.slot_interval_minutes ?? 30),
       minAdvanceMinutes: 0,
       maxAdvanceDays: 180,
       businessHours: page.business_hours ?? DEFAULT_BUSINESS_HOURS,
       candidateStaffIds: pool,
-      staffWorkingHours: wh ?? [],
-      staffBreaks: breaks ?? [],
-      staffLeaves: leaves ?? [],
-      existingAppointments: appts ?? [],
+      staffWorkingHours: wh,
+      staffBreaks: breaks,
+      staffLeaves: leaves,
+      existingAppointments: appts,
       enforceAdvanceRules: false,
     });
     const matchedSlot = slots.find((s) => s.time === d.startTime);
     if (!matchedSlot) {
-      return NextResponse.json({ error: 'Seçilen saatte uygun personel bulunamadı.' }, { status: 409 });
+      return NextResponse.json(
+        { error: 'Seçilen saatte uygun personel bulunamadı.' },
+        { status: 409 }
+      );
     }
     candidateStaffIds = matchedSlot.availableStaffIds;
   } else {
     candidateStaffIds = [d.staffId];
   }
 
-  let createdResult: Record<string, unknown> | null = null;
+  let createdResult: Awaited<ReturnType<typeof createAppointmentAtomic>> | null = null;
   let lastErrorMsg = 'Randevu oluşturulamadı.';
 
   for (const targetStaffId of candidateStaffIds) {
-    const { data: rpcData, error: rpcErr } = await db.rpc('create_appointment_atomic', {
-      p_business_id: businessId,
-      p_booking_customer_id: bookingCustomerId,
-      p_customer_user_id: customerUserId,
-      p_service_id: d.serviceId,
-      p_staff_id: targetStaffId,
-      p_appointment_date: d.appointmentDate,
-      p_start_time: d.startTime,
-      p_customer_notes: '',
-      p_business_notes: d.businessNotes,
-      p_source: 'panel',
-      p_status: d.status,
-    });
-
-    if (!rpcErr && rpcData) {
-      createdResult = rpcData as Record<string, unknown>;
+    try {
+      createdResult = await createAppointmentAtomic({
+        businessId,
+        bookingCustomerId,
+        customerName,
+        customerPhone,
+        serviceId: d.serviceId,
+        staffId: targetStaffId,
+        appointmentDate: d.appointmentDate,
+        startTime: d.startTime,
+        customerNotes: '',
+        businessNotes: d.businessNotes,
+        source: 'panel',
+        status: d.status,
+      });
       break;
+    } catch (err) {
+      lastErrorMsg = err instanceof Error ? err.message : lastErrorMsg;
     }
-    lastErrorMsg = rpcErr?.message ?? lastErrorMsg;
   }
 
   if (!createdResult) {
     return NextResponse.json({ error: lastErrorMsg }, { status: 409 });
   }
 
-  await dispatchAppointmentNotifications(db, {
+  await dispatchAppointmentNotifications({
     businessId,
-    appointmentId: String(createdResult.id),
-    customerUserId,
+    appointmentId: createdResult.id,
+    customerPhone,
     type: d.status === 'confirmed' ? 'appointment_confirmed' : 'new_appointment',
     customerTitle: 'Yeni Randevunuz Oluşturuldu',
     customerMessage: `${ctx.business.name} için ${formatDateTR(d.appointmentDate)} saat ${d.startTime} randevunuz oluşturuldu.`,
@@ -347,71 +516,70 @@ export async function PATCH(req: NextRequest) {
 
   const d = parsed.data;
   const requiredPerm = d.action === 'record_payment' ? 'booking.payments' : 'booking.manage';
-  const { error, ctx, db } = await requireBusinessBookingContext(requiredPerm);
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext(requiredPerm);
+  if (error || !ctx || !ctx.business) return error!;
 
   const businessId = ctx.business.id;
-
-  const { data: existing } = await db
-    .from('appointments')
-    .select('*')
-    .eq('id', d.id)
-    .eq('business_id', businessId)
-    .maybeSingle();
+  const existing = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM appointments WHERE id = ? AND business_id = ? LIMIT 1',
+    [d.id, businessId]
+  );
 
   if (!existing) {
     return NextResponse.json({ error: 'Randevu bulunamadı.' }, { status: 404 });
   }
 
+  const nowStr = toMySqlDateTime();
+
   if (d.action === 'update_notes') {
-    const { data: updated, error: updErr } = await db
-      .from('appointments')
-      .update({ business_notes: d.businessNotes, updated_at: new Date().toISOString() })
-      .eq('id', d.id)
-      .eq('business_id', businessId)
-      .select('*')
-      .single();
-    if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
+    await execute(
+      'UPDATE appointments SET business_notes = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+      [d.businessNotes, nowStr, d.id, businessId]
+    );
+    const updated = await queryOne<Record<string, unknown>>(
+      'SELECT * FROM appointments WHERE id = ? LIMIT 1',
+      [d.id]
+    );
     return NextResponse.json({ appointment: updated });
   }
 
   if (d.action === 'update_status') {
-    const patch: Record<string, unknown> = {
-      status: d.status,
-      updated_at: new Date().toISOString(),
-    };
     if (d.status === 'cancelled') {
-      patch.cancelled_by = 'business';
-      patch.cancellation_reason = d.cancellationReason;
+      await execute(
+        `UPDATE appointments
+         SET status = 'cancelled', cancelled_by = 'business', cancellation_reason = ?, updated_at = ?
+         WHERE id = ? AND business_id = ?`,
+        [d.cancellationReason, nowStr, d.id, businessId]
+      );
+    } else {
+      await execute(
+        'UPDATE appointments SET status = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+        [d.status, nowStr, d.id, businessId]
+      );
     }
 
-    const { data: updated, error: updErr } = await db
-      .from('appointments')
-      .update(patch)
-      .eq('id', d.id)
-      .eq('business_id', businessId)
-      .select('*')
-      .single();
-
-    if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
+    const updated = await queryOne<Record<string, unknown>>(
+      'SELECT * FROM appointments WHERE id = ? LIMIT 1',
+      [d.id]
+    );
 
     if (d.status === 'confirmed' && existing.status !== 'confirmed') {
-      await dispatchAppointmentNotifications(db, {
+      await dispatchAppointmentNotifications({
         businessId,
         appointmentId: d.id,
-        customerUserId: existing.customer_user_id,
+        customerPhone: String(existing.customer_phone ?? ''),
         type: 'appointment_confirmed',
         customerTitle: 'Randevunuz Onaylandı',
-        customerMessage: `${ctx.business.name} - ${formatDateTR(existing.appointment_date)} saat ${formatTimeHHMM(existing.start_time)} randevunuz onaylandı.`,
+        customerMessage: `${ctx.business.name} - ${formatDateTR(String(existing.appointment_date))} saat ${formatTimeHHMM(String(existing.start_time))} randevunuz onaylandı.`,
       });
     } else if (d.status === 'cancelled' && existing.status !== 'cancelled') {
-      await dispatchAppointmentNotifications(db, {
+      await dispatchAppointmentNotifications({
         businessId,
         appointmentId: d.id,
-        customerUserId: existing.customer_user_id,
+        customerPhone: String(existing.customer_phone ?? ''),
         type: 'appointment_cancelled',
         customerTitle: 'Randevunuz İptal Edildi',
-        customerMessage: `${ctx.business.name} - ${formatDateTR(existing.appointment_date)} saat ${formatTimeHHMM(existing.start_time)} randevunuz işletme tarafından iptal edildi.`,
+        customerMessage: `${ctx.business.name} - ${formatDateTR(String(existing.appointment_date))} saat ${formatTimeHHMM(String(existing.start_time))} randevunuz işletme tarafından iptal edildi.`,
       });
     }
 
@@ -419,46 +587,50 @@ export async function PATCH(req: NextRequest) {
   }
 
   if (d.action === 'reschedule') {
-    const { data: res, error: rpcErr } = await db.rpc('reschedule_appointment_atomic', {
-      p_appointment_id: d.id,
-      p_new_date: d.appointmentDate,
-      p_new_start_time: d.startTime,
-      p_new_staff_id: d.staffId ?? null,
-      p_actor: 'business',
-    });
+    try {
+      const res = await rescheduleAppointmentAtomic({
+        appointmentId: d.id,
+        businessId,
+        newDate: d.appointmentDate,
+        newStartTime: d.startTime,
+        newStaffId: d.staffId ?? null,
+      });
 
-    if (rpcErr) {
-      return NextResponse.json({ error: rpcErr.message }, { status: 409 });
+      await dispatchAppointmentNotifications({
+        businessId,
+        appointmentId: d.id,
+        customerPhone: String(existing.customer_phone ?? ''),
+        type: 'appointment_rescheduled',
+        customerTitle: 'Randevu Saatiniz Güncellendi',
+        customerMessage: `${ctx.business.name} randevunuz ${formatDateTR(d.appointmentDate)} saat ${d.startTime} olarak güncellendi.`,
+      });
+
+      return NextResponse.json({ result: res });
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : 'Saat güncellenemedi.' },
+        { status: 409 }
+      );
     }
+  }
 
-    await dispatchAppointmentNotifications(db, {
-      businessId,
+  try {
+    const payRes = await recordAppointmentPaymentAtomic({
       appointmentId: d.id,
-      customerUserId: existing.customer_user_id,
-      type: 'appointment_rescheduled',
-      customerTitle: 'Randevu Saatiniz Güncellendi',
-      customerMessage: `${ctx.business.name} randevunuz ${formatDateTR(d.appointmentDate)} saat ${d.startTime} olarak güncellendi.`,
+      businessId,
+      userId: ctx.userId,
+      amount: roundCurrency(d.amount),
+      paymentType: d.paymentType,
+      paymentMethod: d.paymentMethod,
+      paymentDate: d.paymentDate || getIstanbulTodayISO(),
+      notes: d.notes,
+      idempotencyKey: d.idempotencyKey ?? null,
     });
-
-    return NextResponse.json({ result: res });
+    return NextResponse.json({ payment: payRes });
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : 'Ödeme kaydedilemedi.' },
+      { status: 400 }
+    );
   }
-
-  // action === 'record_payment' -> Mevcut Gelir/Gider Tablolarına Atomik Kayıt
-  const { data: payRes, error: payErr } = await db.rpc('record_appointment_payment', {
-    p_appointment_id: d.id,
-    p_business_id: businessId,
-    p_user_id: ctx.userId,
-    p_amount: roundCurrency(d.amount),
-    p_payment_type: d.paymentType,
-    p_payment_method: d.paymentMethod,
-    p_payment_date: d.paymentDate || getIstanbulTodayISO(),
-    p_notes: d.notes,
-    p_idempotency_key: d.idempotencyKey ?? null,
-  });
-
-  if (payErr) {
-    return NextResponse.json({ error: payErr.message }, { status: 400 });
-  }
-
-  return NextResponse.json({ payment: payRes });
 }

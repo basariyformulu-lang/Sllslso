@@ -1,4 +1,4 @@
-import type { SupabaseClient } from '@supabase/supabase-js';
+import { execute, toMySqlDateTime, uuid } from '@/lib/db';
 
 export type AppointmentNotificationType =
   | 'new_appointment'
@@ -7,24 +7,23 @@ export type AppointmentNotificationType =
   | 'appointment_rescheduled'
   | 'appointment_reminder';
 
-export async function dispatchAppointmentNotifications(
-  db: SupabaseClient,
-  params: {
-    businessId: string;
-    appointmentId: string;
-    customerUserId?: string | null;
-    type: AppointmentNotificationType;
-    businessTitle?: string;
-    businessMessage?: string;
-    customerTitle?: string;
-    customerMessage?: string;
-    businessLink?: string;
-  }
-) {
+export async function dispatchAppointmentNotifications(params: {
+  businessId: string;
+  appointmentId: string;
+  customerUserId?: string | null;
+  customerPhone?: string;
+  type: AppointmentNotificationType;
+  businessTitle?: string;
+  businessMessage?: string;
+  customerTitle?: string;
+  customerMessage?: string;
+  businessLink?: string;
+}) {
   const {
     businessId,
     appointmentId,
-    customerUserId,
+    customerUserId = null,
+    customerPhone = '',
     type,
     businessTitle,
     businessMessage,
@@ -33,49 +32,40 @@ export async function dispatchAppointmentNotifications(
     businessLink = '/panel/randevu/takvim',
   } = params;
 
-  const inserts: Array<Record<string, unknown>> = [];
+  const nowStr = toMySqlDateTime();
 
   if (businessTitle && businessMessage) {
-    inserts.push({
-      business_id: businessId,
-      appointment_id: appointmentId,
-      recipient_type: 'business',
-      recipient_user_id: null,
-      notification_type: type,
-      channel: 'in_app',
-      title: businessTitle,
-      message: businessMessage,
-      delivery_status: 'sent',
-      is_read: false,
-    });
+    await execute(
+      `INSERT INTO appointment_notifications
+       (id, business_id, appointment_id, recipient_type, recipient_user_id, recipient_phone, notification_type, channel, title, message, delivery_status, is_read, created_at)
+       VALUES (?, ?, ?, 'business', NULL, '', ?, 'in_app', ?, ?, 'sent', 0, ?)`,
+      [uuid(), businessId, appointmentId, type, businessTitle, businessMessage, nowStr]
+    );
 
-    // Mevcut yönetim panelindeki bildirim ziline de yansıt
-    await db.from('notifications').insert({
-      business_id: businessId,
-      type,
-      title: businessTitle,
-      message: businessMessage,
-      link: businessLink,
-      is_read: false,
-    });
+    await execute(
+      `INSERT INTO notifications
+       (id, business_id, recipient_user_id, type, title, message, link, is_read, created_at)
+       VALUES (?, ?, NULL, ?, ?, ?, ?, 0, ?)`,
+      [uuid(), businessId, type, businessTitle, businessMessage, businessLink, nowStr]
+    );
   }
 
-  if (customerUserId && customerTitle && customerMessage) {
-    inserts.push({
-      business_id: businessId,
-      appointment_id: appointmentId,
-      recipient_type: 'customer',
-      recipient_user_id: customerUserId,
-      notification_type: type,
-      channel: 'in_app',
-      title: customerTitle,
-      message: customerMessage,
-      delivery_status: 'sent',
-      is_read: false,
-    });
-  }
-
-  if (inserts.length > 0) {
-    await db.from('appointment_notifications').insert(inserts);
+  if (customerTitle && customerMessage) {
+    await execute(
+      `INSERT INTO appointment_notifications
+       (id, business_id, appointment_id, recipient_type, recipient_user_id, recipient_phone, notification_type, channel, title, message, delivery_status, is_read, created_at)
+       VALUES (?, ?, ?, 'customer', ?, ?, ?, 'in_app', ?, ?, 'sent', 0, ?)`,
+      [
+        uuid(),
+        businessId,
+        appointmentId,
+        customerUserId,
+        customerPhone,
+        type,
+        customerTitle,
+        customerMessage,
+        nowStr,
+      ]
+    );
   }
 }

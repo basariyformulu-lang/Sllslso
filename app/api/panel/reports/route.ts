@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireBusinessContext } from '@/lib/auth-server';
+import { query, toBool } from '@/lib/db';
 import { getIstanbulMonthBounds, getIstanbulTodayISO, roundCurrency } from '@/lib/format';
 
 export async function GET(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessContext('reports.view');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('reports.view');
+  if (error || !ctx || !ctx.business) return error!;
 
   const { searchParams } = new URL(req.url);
   const { start: defaultStart } = getIstanbulMonthBounds();
@@ -14,73 +15,73 @@ export async function GET(req: NextRequest) {
   const businessId = ctx.business.id;
 
   const [
-    { data: incomes },
-    { data: expenses },
-    { data: customers },
-    { data: custTx },
-    { data: suppliers },
-    { data: suppTx },
-    { data: creditSales },
-    { data: recurringCards },
-    { data: recurringPeriods },
+    incomes,
+    expenses,
+    customers,
+    custTx,
+    suppliers,
+    suppTx,
+    creditSales,
+    recurringCards,
+    recurringPeriods,
   ] = await Promise.all([
-    db
-      .from('income_transactions')
-      .select('*')
-      .eq('business_id', businessId)
-      .eq('is_cancelled', false)
-      .gte('transaction_date', startDate)
-      .lte('transaction_date', endDate)
-      .order('transaction_date', { ascending: false }),
-    db
-      .from('expense_transactions')
-      .select('*')
-      .eq('business_id', businessId)
-      .eq('is_cancelled', false)
-      .gte('transaction_date', startDate)
-      .lte('transaction_date', endDate)
-      .order('transaction_date', { ascending: false }),
-    db.from('customers').select('*').eq('business_id', businessId),
-    db
-      .from('customer_transactions')
-      .select('*, customer:customers(name, last_name, phone)')
-      .eq('business_id', businessId)
-      .eq('is_cancelled', false)
-      .order('transaction_date', { ascending: false }),
-    db.from('suppliers').select('*').eq('business_id', businessId),
-    db
-      .from('supplier_transactions')
-      .select('*, supplier:suppliers(company_name, phone)')
-      .eq('business_id', businessId)
-      .eq('is_cancelled', false)
-      .order('transaction_date', { ascending: false }),
-    db
-      .from('credit_sales')
-      .select('*, customer:customers(name, last_name, phone)')
-      .eq('business_id', businessId)
-      .eq('is_cancelled', false)
-      .order('due_date', { ascending: true }),
-    db
-      .from('recurring_expenses')
-      .select('*')
-      .eq('business_id', businessId)
-      .order('title', { ascending: true }),
-    db
-      .from('recurring_expense_periods')
-      .select('*, recurring_expense:recurring_expenses(title, category)')
-      .eq('business_id', businessId)
-      .eq('status', 'paid')
-      .gte('paid_date', startDate)
-      .lte('paid_date', endDate)
-      .order('paid_date', { ascending: false }),
+    query<Record<string, unknown>>(
+      `SELECT * FROM income_transactions
+       WHERE business_id = ? AND is_cancelled = 0 AND transaction_date >= ? AND transaction_date <= ?
+       ORDER BY transaction_date DESC`,
+      [businessId, startDate, endDate]
+    ),
+    query<Record<string, unknown>>(
+      `SELECT * FROM expense_transactions
+       WHERE business_id = ? AND is_cancelled = 0 AND transaction_date >= ? AND transaction_date <= ?
+       ORDER BY transaction_date DESC`,
+      [businessId, startDate, endDate]
+    ),
+    query<Record<string, unknown>>('SELECT * FROM customers WHERE business_id = ?', [businessId]),
+    query<Record<string, unknown>>(
+      `SELECT ct.*, c.name AS c_name, c.last_name AS c_last_name, c.phone AS c_phone
+       FROM customer_transactions ct
+       LEFT JOIN customers c ON c.id = ct.customer_id
+       WHERE ct.business_id = ? AND ct.is_cancelled = 0
+       ORDER BY ct.transaction_date DESC`,
+      [businessId]
+    ),
+    query<Record<string, unknown>>('SELECT * FROM suppliers WHERE business_id = ?', [businessId]),
+    query<Record<string, unknown>>(
+      `SELECT st.*, s.company_name AS s_company_name, s.phone AS s_phone
+       FROM supplier_transactions st
+       LEFT JOIN suppliers s ON s.id = st.supplier_id
+       WHERE st.business_id = ? AND st.is_cancelled = 0
+       ORDER BY st.transaction_date DESC`,
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      `SELECT cs.*, c.name AS c_name, c.last_name AS c_last_name, c.phone AS c_phone
+       FROM credit_sales cs
+       LEFT JOIN customers c ON c.id = cs.customer_id
+       WHERE cs.business_id = ? AND cs.is_cancelled = 0
+       ORDER BY cs.due_date ASC`,
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM recurring_expenses WHERE business_id = ? ORDER BY title ASC',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      `SELECT p.*, r.title AS r_title, r.category AS r_category
+       FROM recurring_expense_periods p
+       LEFT JOIN recurring_expenses r ON r.id = p.recurring_expense_id
+       WHERE p.business_id = ? AND p.status = 'paid' AND p.paid_date >= ? AND p.paid_date <= ?
+       ORDER BY p.paid_date DESC`,
+      [businessId, startDate, endDate]
+    ),
   ]);
 
-  // Günlük & Aylık gelir/gider agregasyonu
   const dailyMap = new Map<string, { date: string; income: number; expense: number }>();
   const monthlyMap = new Map<string, { month: string; income: number; expense: number }>();
 
-  (incomes ?? []).forEach((i) => {
-    const d = i.transaction_date;
+  incomes.forEach((i) => {
+    const d = String(i.transaction_date);
     const m = d.slice(0, 7);
     const curD = dailyMap.get(d) ?? { date: d, income: 0, expense: 0 };
     curD.income = roundCurrency(curD.income + Number(i.amount));
@@ -91,8 +92,8 @@ export async function GET(req: NextRequest) {
     monthlyMap.set(m, curM);
   });
 
-  (expenses ?? []).forEach((e) => {
-    const d = e.transaction_date;
+  expenses.forEach((e) => {
+    const d = String(e.transaction_date);
     const m = d.slice(0, 7);
     const curD = dailyMap.get(d) ?? { date: d, income: 0, expense: 0 };
     curD.expense = roundCurrency(curD.expense + Number(e.amount));
@@ -103,18 +104,24 @@ export async function GET(req: NextRequest) {
     monthlyMap.set(m, curM);
   });
 
-  // Müşteri alacak raporu
-  const customerReport = (customers ?? [])
+  const customerReport = customers
     .map((c) => {
-      const txs = (custTx ?? []).filter((t) => t.customer_id === c.id);
+      const cid = String(c.id);
+      const txs = custTx.filter((t) => String(t.customer_id) === cid);
       const opening = Number(c.opening_balance ?? 0);
-      const debt = txs.filter((t) => t.transaction_type === 'debt').reduce((a, t) => a + Number(t.amount), 0);
-      const paid = txs.filter((t) => t.transaction_type === 'payment').reduce((a, t) => a + Number(t.amount), 0);
-      const balance = roundCurrency(opening + txs.reduce((a, t) => a + Number(t.signed_amount), 0));
+      const debt = txs
+        .filter((t) => t.transaction_type === 'debt')
+        .reduce((a, t) => a + Number(t.amount), 0);
+      const paid = txs
+        .filter((t) => t.transaction_type === 'payment')
+        .reduce((a, t) => a + Number(t.amount), 0);
+      const balance = roundCurrency(
+        opening + txs.reduce((a, t) => a + Number(t.signed_amount), 0)
+      );
       return {
-        id: c.id,
-        name: `${c.name} ${c.last_name}`.trim(),
-        phone: c.phone,
+        id: cid,
+        name: `${String(c.name)} ${String(c.last_name ?? '')}`.trim(),
+        phone: String(c.phone ?? ''),
         totalDebt: roundCurrency(opening + debt),
         totalPayment: roundCurrency(paid),
         balance,
@@ -122,18 +129,24 @@ export async function GET(req: NextRequest) {
     })
     .filter((r) => r.balance !== 0 || r.totalDebt > 0);
 
-  // Toptancı borç raporu
-  const supplierReport = (suppliers ?? [])
+  const supplierReport = suppliers
     .map((s) => {
-      const txs = (suppTx ?? []).filter((t) => t.supplier_id === s.id);
+      const sid = String(s.id);
+      const txs = suppTx.filter((t) => String(t.supplier_id) === sid);
       const opening = Number(s.opening_balance ?? 0);
-      const debt = txs.filter((t) => t.transaction_type === 'debt').reduce((a, t) => a + Number(t.amount), 0);
-      const paid = txs.filter((t) => t.transaction_type === 'payment').reduce((a, t) => a + Number(t.amount), 0);
-      const balance = roundCurrency(opening + txs.reduce((a, t) => a + Number(t.signed_amount), 0));
+      const debt = txs
+        .filter((t) => t.transaction_type === 'debt')
+        .reduce((a, t) => a + Number(t.amount), 0);
+      const paid = txs
+        .filter((t) => t.transaction_type === 'payment')
+        .reduce((a, t) => a + Number(t.amount), 0);
+      const balance = roundCurrency(
+        opening + txs.reduce((a, t) => a + Number(t.signed_amount), 0)
+      );
       return {
-        id: s.id,
-        companyName: s.company_name,
-        phone: s.phone,
+        id: sid,
+        companyName: String(s.company_name),
+        phone: String(s.phone ?? ''),
         totalDebt: roundCurrency(opening + debt),
         totalPayment: roundCurrency(paid),
         balance,
@@ -141,85 +154,91 @@ export async function GET(req: NextRequest) {
     })
     .filter((r) => r.balance !== 0 || r.totalDebt > 0);
 
-  // Vadesi gelen alacaklar
-  const dueReceivables = (creditSales ?? [])
-    .filter((cs) => Number(cs.total_amount) > Number(cs.paid_amount) && cs.due_date <= endDate)
+  const dueReceivables = creditSales
+    .filter(
+      (cs) =>
+        Number(cs.total_amount) > Number(cs.paid_amount) && String(cs.due_date) <= endDate
+    )
     .map((cs) => ({
-      id: cs.id,
-      customerName: cs.customer ? `${cs.customer.name} ${cs.customer.last_name}`.trim() : '—',
-      description: cs.description,
-      saleDate: cs.sale_date,
-      dueDate: cs.due_date,
-      totalAmount: roundCurrency(cs.total_amount),
-      paidAmount: roundCurrency(cs.paid_amount),
+      id: String(cs.id),
+      customerName: cs.c_name
+        ? `${String(cs.c_name)} ${String(cs.c_last_name ?? '')}`.trim()
+        : '—',
+      description: String(cs.description),
+      saleDate: String(cs.sale_date),
+      dueDate: String(cs.due_date),
+      totalAmount: roundCurrency(Number(cs.total_amount)),
+      paidAmount: roundCurrency(Number(cs.paid_amount)),
       remainingAmount: roundCurrency(Number(cs.total_amount) - Number(cs.paid_amount)),
-      isOverdue: cs.due_date < today,
+      isOverdue: String(cs.due_date) < today,
     }));
 
-  // Vadesi gelen toptancı borçları
-  const duePayables = (suppTx ?? [])
-    .filter((t) => t.transaction_type === 'debt' && t.due_date && t.due_date <= endDate)
+  const duePayables = suppTx
+    .filter(
+      (t) =>
+        t.transaction_type === 'debt' && t.due_date && String(t.due_date) <= endDate
+    )
     .map((t) => ({
-      id: t.id,
-      supplierName: t.supplier?.company_name ?? '—',
-      description: t.description,
-      transactionDate: t.transaction_date,
-      dueDate: t.due_date,
-      amount: roundCurrency(t.amount),
-      isOverdue: t.due_date < today,
+      id: String(t.id),
+      supplierName: String(t.s_company_name ?? '—'),
+      description: String(t.description),
+      transactionDate: String(t.transaction_date),
+      dueDate: String(t.due_date),
+      amount: roundCurrency(Number(t.amount)),
+      isOverdue: String(t.due_date) < today,
     }));
 
-  // Tahsilat ve ödeme geçmişi (tarih aralığına göre)
-  const collectionHistory = (custTx ?? []).filter(
+  const collectionHistory = custTx.filter(
     (t) =>
       t.transaction_type === 'payment' &&
-      t.transaction_date >= startDate &&
-      t.transaction_date <= endDate
+      String(t.transaction_date) >= startDate &&
+      String(t.transaction_date) <= endDate
   );
 
-  const supplierPaymentHistory = (suppTx ?? []).filter(
+  const supplierPaymentHistory = suppTx.filter(
     (t) =>
       t.transaction_type === 'payment' &&
-      t.transaction_date >= startDate &&
-      t.transaction_date <= endDate
+      String(t.transaction_date) >= startDate &&
+      String(t.transaction_date) <= endDate
   );
 
-  // Birleşik finansal hareketler
   const allMovements = [
-    ...(incomes ?? []).map((i) => ({
-      id: `inc-${i.id}`,
-      date: i.transaction_date,
+    ...incomes.map((i) => ({
+      id: `inc-${String(i.id)}`,
+      date: String(i.transaction_date),
       type: 'Gelir',
-      party: i.category_name,
-      description: i.title,
-      amount: roundCurrency(i.amount),
+      party: String(i.category_name),
+      description: String(i.title),
+      amount: roundCurrency(Number(i.amount)),
       direction: '+' as const,
     })),
-    ...(expenses ?? []).map((e) => ({
-      id: `exp-${e.id}`,
-      date: e.transaction_date,
+    ...expenses.map((e) => ({
+      id: `exp-${String(e.id)}`,
+      date: String(e.transaction_date),
       type: 'Gider',
-      party: e.category_name,
-      description: e.title,
-      amount: roundCurrency(e.amount),
+      party: String(e.category_name),
+      description: String(e.title),
+      amount: roundCurrency(Number(e.amount)),
       direction: '-' as const,
     })),
     ...collectionHistory.map((c) => ({
-      id: `col-${c.id}`,
-      date: c.transaction_date,
+      id: `col-${String(c.id)}`,
+      date: String(c.transaction_date),
       type: 'Müşteri Tahsilatı',
-      party: c.customer ? `${c.customer.name} ${c.customer.last_name}`.trim() : 'Müşteri',
-      description: c.description,
-      amount: roundCurrency(c.amount),
+      party: c.c_name
+        ? `${String(c.c_name)} ${String(c.c_last_name ?? '')}`.trim()
+        : 'Müşteri',
+      description: String(c.description),
+      amount: roundCurrency(Number(c.amount)),
       direction: '+' as const,
     })),
     ...supplierPaymentHistory.map((p) => ({
-      id: `pay-${p.id}`,
-      date: p.transaction_date,
+      id: `pay-${String(p.id)}`,
+      date: String(p.transaction_date),
       type: 'Toptancı Ödemesi',
-      party: p.supplier?.company_name ?? 'Toptancı',
-      description: p.description,
-      amount: roundCurrency(p.amount),
+      party: String(p.s_company_name ?? 'Toptancı'),
+      description: String(p.description),
+      amount: roundCurrency(Number(p.amount)),
       direction: '-' as const,
     })),
   ].sort((a, b) => b.date.localeCompare(a.date));
@@ -234,8 +253,11 @@ export async function GET(req: NextRequest) {
     duePayables,
     collectionHistory,
     supplierPaymentHistory,
-    recurringSummary: (recurringCards ?? []).filter((r) => r.is_active),
-    recurringRealized: recurringPeriods ?? [],
+    recurringSummary: recurringCards.filter((r) => toBool(r.is_active)),
+    recurringRealized: recurringPeriods.map((p) => ({
+      ...p,
+      recurring_expense: { title: p.r_title, category: p.r_category },
+    })),
     allMovements,
   });
 }

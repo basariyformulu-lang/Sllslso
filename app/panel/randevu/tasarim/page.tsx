@@ -8,11 +8,13 @@ import {
   CheckCircle2,
   ExternalLink,
   Image as ImageIcon,
+  Instagram,
   Layers,
   Monitor,
   Palette,
   Phone,
   Plus,
+  RefreshCw,
   Save,
   Smartphone,
   Trash2,
@@ -33,19 +35,21 @@ import {
 } from '@/lib/booking-helpers';
 import type {
   BookingGalleryItem,
+  BookingInstagramPost,
   BookingPage,
   BookingSectionVisibility,
   BookingService,
   BookingStaff,
 } from '@/lib/types';
 
-type EditorTab = 'theme' | 'media' | 'sections' | 'contact';
+type EditorTab = 'theme' | 'media' | 'instagram' | 'sections' | 'contact';
 
 export default function BookingDesignEditorPage() {
   const { showToast } = useToast();
   const [readOnly, setReadOnly] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [fetchingIg, setFetchingIg] = useState(false);
 
   const [tab, setTab] = useState<EditorTab>('theme');
   const [previewDevice, setPreviewDevice] = useState<'desktop' | 'mobile'>('desktop');
@@ -55,6 +59,7 @@ export default function BookingDesignEditorPage() {
   const [staff, setStaff] = useState<BookingStaff[]>([]);
   const [reviews, setReviews] = useState<StorefrontReview[]>([]);
   const [newGalleryUrl, setNewGalleryUrl] = useState('');
+  const [newIgPostUrl, setNewIgPostUrl] = useState('');
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -98,10 +103,11 @@ export default function BookingDesignEditorPage() {
 
   function toggleSection(key: keyof BookingSectionVisibility) {
     if (!page) return;
+    const currentVis = { ...DEFAULT_SECTION_VISIBILITY, ...(page.section_visibility ?? {}) };
     updatePage({
       section_visibility: {
-        ...page.section_visibility,
-        [key]: !page.section_visibility[key],
+        ...currentVis,
+        [key]: !currentVis[key],
       },
     });
   }
@@ -125,20 +131,22 @@ export default function BookingDesignEditorPage() {
 
   function addGalleryItem(url: string) {
     if (!page || !url.trim()) return;
+    const currentGallery = page.gallery_images ?? [];
     const item: BookingGalleryItem = {
       id: `gal-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       url: url.trim(),
       caption: '',
-      sort_order: page.gallery_images.length,
+      sort_order: currentGallery.length,
     };
-    updatePage({ gallery_images: [...page.gallery_images, item] });
+    updatePage({ gallery_images: [...currentGallery, item] });
   }
 
   function moveGallery(idx: number, dir: -1 | 1) {
     if (!page) return;
+    const currentGallery = page.gallery_images ?? [];
     const target = idx + dir;
-    if (target < 0 || target >= page.gallery_images.length) return;
-    const next = [...page.gallery_images];
+    if (target < 0 || target >= currentGallery.length) return;
+    const next = [...currentGallery];
     const [moved] = next.splice(idx, 1);
     next.splice(target, 0, moved);
     updatePage({
@@ -148,11 +156,86 @@ export default function BookingDesignEditorPage() {
 
   function removeGallery(id: string) {
     if (!page) return;
+    const currentGallery = page.gallery_images ?? [];
     updatePage({
-      gallery_images: page.gallery_images
+      gallery_images: currentGallery
         .filter((g) => g.id !== id)
         .map((g, i) => ({ ...g, sort_order: i })),
     });
+  }
+
+  function addInstagramPost(imageUrl: string) {
+    if (!page || !imageUrl.trim()) return;
+    const current = page.instagram_posts ?? [];
+    if (current.length >= 6) {
+      showToast('En fazla 6 Instagram gönderisi eklenebilir', 'error');
+      return;
+    }
+    const post: BookingInstagramPost = {
+      id: `ig-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      image_url: imageUrl.trim(),
+      caption: '',
+      post_url: page.instagram_url || '',
+    };
+    updatePage({ instagram_posts: [...current, post] });
+  }
+
+  function removeInstagramPost(id: string) {
+    if (!page) return;
+    updatePage({
+      instagram_posts: (page.instagram_posts ?? []).filter((p) => p.id !== id),
+    });
+  }
+
+  async function handleFetchInstagram() {
+    if (!page) return;
+    const input = (page.instagram_username || page.instagram_url || '').trim();
+    if (!input) {
+      showToast('Önce Instagram kullanıcı adı veya profil bağlantısı girin', 'error');
+      return;
+    }
+    setFetchingIg(true);
+    try {
+      const res = await fetch('/api/panel/booking/instagram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instagramInput: input }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        showToast(json.error || 'Instagram bilgileri alınamadı', 'error');
+        return;
+      }
+      if (json.profile) {
+        updatePage({
+          instagram_url: json.profile.instagram_url ?? page.instagram_url,
+          instagram_username: json.profile.instagram_username ?? page.instagram_username,
+          ...(json.fetched
+            ? {
+                instagram_display_name:
+                  json.profile.instagram_display_name ?? page.instagram_display_name,
+                instagram_avatar_url:
+                  json.profile.instagram_avatar_url ?? page.instagram_avatar_url,
+                instagram_followers_count:
+                  json.profile.instagram_followers_count ?? page.instagram_followers_count,
+                instagram_posts_count:
+                  json.profile.instagram_posts_count ?? page.instagram_posts_count,
+                instagram_posts:
+                  (json.profile.instagram_posts ?? []).length > 0
+                    ? json.profile.instagram_posts
+                    : page.instagram_posts,
+              }
+            : {}),
+        });
+      }
+      if (json.fetched) {
+        showToast('Instagram profil ve gönderi bilgileri çekildi!', 'success');
+      } else {
+        showToast(json.message || 'Otomatik çekim kısıtlandı, bilgileri aşağıdan girebilirsiniz', 'info');
+      }
+    } finally {
+      setFetchingIg(false);
+    }
   }
 
   function moveService(idx: number, dir: -1 | 1) {
@@ -177,16 +260,22 @@ export default function BookingDesignEditorPage() {
           description: page.description,
           logo_url: page.logo_url,
           cover_image_url: page.cover_image_url,
-          gallery_images: page.gallery_images,
+          gallery_images: page.gallery_images ?? [],
           phone: page.phone,
           whatsapp: page.whatsapp,
           address: page.address,
           map_location: page.map_location,
           instagram_url: page.instagram_url,
+          instagram_username: page.instagram_username ?? '',
+          instagram_display_name: page.instagram_display_name ?? '',
+          instagram_avatar_url: page.instagram_avatar_url ?? '',
+          instagram_followers_count: Number(page.instagram_followers_count ?? 0),
+          instagram_posts_count: Number(page.instagram_posts_count ?? 0),
+          instagram_posts: (page.instagram_posts ?? []).slice(0, 6),
           theme_preset: page.theme_preset,
           primary_color: page.primary_color,
           secondary_color: page.secondary_color,
-          section_visibility: page.section_visibility,
+          section_visibility: { ...DEFAULT_SECTION_VISIBILITY, ...(page.section_visibility ?? {}) },
           status: targetStatus,
           service_order_ids: services.map((s) => s.id),
         }),
@@ -221,9 +310,10 @@ export default function BookingDesignEditorPage() {
 
   const safePage: BookingPage = {
     ...page,
-    section_visibility: page.section_visibility ?? DEFAULT_SECTION_VISIBILITY,
+    section_visibility: { ...DEFAULT_SECTION_VISIBILITY, ...(page.section_visibility ?? {}) },
     business_hours: page.business_hours ?? DEFAULT_BUSINESS_HOURS,
     gallery_images: page.gallery_images ?? [],
+    instagram_posts: page.instagram_posts ?? [],
   };
 
   return (
@@ -236,7 +326,7 @@ export default function BookingDesignEditorPage() {
               Randevu Sayfası Tasarım Editörü
             </h1>
             <p className="text-xs text-slate-500">
-              Temanızı, renklerinizi, görsellerinizi ve sayfa bölümlerinizi canlı önizleyerek düzenleyin.
+              Temanızı, renklerinizi, Instagram vitrininizi, görsellerinizi ve sayfa bölümlerinizi canlı önizleyerek düzenleyin.
             </p>
           </div>
 
@@ -295,7 +385,9 @@ export default function BookingDesignEditorPage() {
                   className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50"
                 >
                   <CheckCircle2 className="h-3.5 w-3.5" />
-                  <span>{safePage.status === 'published' ? 'Güncelle & Yayında Tut' : 'Kaydet & Yayınla'}</span>
+                  <span>
+                    {safePage.status === 'published' ? 'Güncelle & Yayında Tut' : 'Kaydet & Yayınla'}
+                  </span>
                 </button>
               </>
             )}
@@ -308,11 +400,12 @@ export default function BookingDesignEditorPage() {
         <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
           {/* Sol Kontroller */}
           <div className="xl:col-span-5 rounded-xl border border-slate-200 bg-white shadow-xs overflow-hidden flex flex-col">
-            <div className="grid grid-cols-4 border-b border-slate-200 bg-slate-50 text-[11px] font-semibold">
+            <div className="grid grid-cols-5 border-b border-slate-200 bg-slate-50 text-[11px] font-semibold">
               {[
-                { id: 'theme', label: 'Tema & Metin', icon: Palette },
-                { id: 'media', label: 'Görsel & Galeri', icon: ImageIcon },
-                { id: 'sections', label: 'Bölüm & Sıra', icon: Layers },
+                { id: 'theme', label: 'Tema', icon: Palette },
+                { id: 'media', label: 'Görsel', icon: ImageIcon },
+                { id: 'instagram', label: 'Instagram', icon: Instagram },
+                { id: 'sections', label: 'Bölümler', icon: Layers },
                 { id: 'contact', label: 'İletişim', icon: Phone },
               ].map((t) => {
                 const Icon = t.icon;
@@ -321,7 +414,7 @@ export default function BookingDesignEditorPage() {
                     key={t.id}
                     type="button"
                     onClick={() => setTab(t.id as EditorTab)}
-                    className={`flex flex-col items-center gap-1 py-2.5 px-2 transition-colors ${
+                    className={`flex flex-col items-center gap-1 py-2.5 px-1 transition-colors ${
                       tab === t.id
                         ? 'bg-white text-[#0F2942] border-b-2 border-[#0F2942]'
                         : 'text-slate-500 hover:text-slate-800'
@@ -596,6 +689,230 @@ export default function BookingDesignEditorPage() {
                 </>
               )}
 
+              {tab === 'instagram' && (
+                <div className="space-y-4">
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-3.5 space-y-2.5">
+                    <label className="block font-semibold text-slate-800">
+                      Instagram Kullanıcı Adı veya Profil Linki
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        disabled={readOnly}
+                        value={safePage.instagram_username || safePage.instagram_url}
+                        onChange={(e) =>
+                          updatePage({
+                            instagram_username: e.target.value.replace(/^@/, ''),
+                            instagram_url: e.target.value.startsWith('http')
+                              ? e.target.value
+                              : e.target.value
+                              ? `https://instagram.com/${e.target.value.replace(/^@/, '')}`
+                              : '',
+                          })
+                        }
+                        placeholder="@aliberber veya https://instagram.com/..."
+                        className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs"
+                      />
+                      {!readOnly && (
+                        <button
+                          type="button"
+                          disabled={fetchingIg}
+                          onClick={handleFetchInstagram}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-[#0F2942] px-3 py-2 text-[11px] font-semibold text-white hover:bg-[#173B5E] disabled:opacity-50 whitespace-nowrap"
+                        >
+                          <RefreshCw className={`h-3.5 w-3.5 ${fetchingIg ? 'animate-spin' : ''}`} />
+                          <span>Instagram&apos;dan Çek</span>
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      Profil bilgisi ve son 6 gönderi otomatik çekilemezse aşağıdaki alanlardan manuel olarak düzenleyebilirsiniz.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block font-semibold text-slate-700">Profil Görünen Ad</label>
+                      <input
+                        type="text"
+                        disabled={readOnly}
+                        value={safePage.instagram_display_name ?? ''}
+                        onChange={(e) => updatePage({ instagram_display_name: e.target.value })}
+                        placeholder={safePage.page_title}
+                        className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-1.5"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700">Kullanıcı Adı</label>
+                      <input
+                        type="text"
+                        disabled={readOnly}
+                        value={safePage.instagram_username ?? ''}
+                        onChange={(e) =>
+                          updatePage({ instagram_username: e.target.value.replace(/^@/, '') })
+                        }
+                        placeholder="kullaniciadi"
+                        className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-1.5 font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700">Takipçi Sayısı</label>
+                      <input
+                        type="number"
+                        min={0}
+                        disabled={readOnly}
+                        value={safePage.instagram_followers_count ?? 0}
+                        onChange={(e) =>
+                          updatePage({ instagram_followers_count: Number(e.target.value || 0) })
+                        }
+                        className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-1.5 font-mono"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-semibold text-slate-700">Gönderi Sayısı</label>
+                      <input
+                        type="number"
+                        min={0}
+                        disabled={readOnly}
+                        value={safePage.instagram_posts_count ?? 0}
+                        onChange={(e) =>
+                          updatePage({ instagram_posts_count: Number(e.target.value || 0) })
+                        }
+                        className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-1.5 font-mono"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700">
+                      Instagram Profil Fotoğrafı (Avatar)
+                    </label>
+                    <div className="mt-1 flex items-center gap-2">
+                      <input
+                        type="text"
+                        disabled={readOnly}
+                        value={safePage.instagram_avatar_url ?? ''}
+                        onChange={(e) => updatePage({ instagram_avatar_url: e.target.value })}
+                        placeholder="https://... veya yükleyin (boşsa işletme logosu kullanılır)"
+                        className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-xs"
+                      />
+                      {!readOnly && (
+                        <label className="inline-flex cursor-pointer items-center gap-1 rounded-lg border border-slate-300 px-3 py-1.5 font-medium text-slate-700 hover:bg-slate-50">
+                          <Upload className="h-3.5 w-3.5" />
+                          <span>Yükle</span>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            onChange={(e) =>
+                              handleFileToField(e, (url) =>
+                                updatePage({ instagram_avatar_url: url })
+                              )
+                            }
+                            className="hidden"
+                          />
+                        </label>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="border-t border-slate-200 pt-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <label className="font-semibold text-slate-800">
+                        Son 6 Gönderi ({(safePage.instagram_posts ?? []).length} / 6)
+                      </label>
+                      {!readOnly && (safePage.instagram_posts ?? []).length < 6 && (
+                        <label className="inline-flex cursor-pointer items-center gap-1 rounded-lg bg-[#0F2942] px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-[#173B5E]">
+                          <Upload className="h-3 w-3" />
+                          <span>Gönderi Görseli Yükle</span>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            onChange={(e) => handleFileToField(e, addInstagramPost)}
+                            className="hidden"
+                          />
+                        </label>
+                      )}
+                    </div>
+
+                    {!readOnly && (safePage.instagram_posts ?? []).length < 6 && (
+                      <div className="flex gap-2">
+                        <input
+                          type="url"
+                          value={newIgPostUrl}
+                          onChange={(e) => setNewIgPostUrl(e.target.value)}
+                          placeholder="Gönderi görsel URL'si (https://...)"
+                          className="flex-1 rounded-lg border border-slate-300 px-3 py-1.5 text-xs"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            addInstagramPost(newIgPostUrl);
+                            setNewIgPostUrl('');
+                          }}
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-3 py-1.5 font-semibold text-slate-700 hover:bg-slate-50"
+                        >
+                          <Plus className="h-3.5 w-3.5" />
+                          <span>Ekle</span>
+                        </button>
+                      </div>
+                    )}
+
+                    <div className="space-y-2">
+                      {(safePage.instagram_posts ?? []).map((post) => (
+                        <div
+                          key={post.id}
+                          className="flex items-start gap-2.5 rounded-lg border border-slate-200 p-2"
+                        >
+                          <img
+                            src={post.image_url}
+                            alt="Instagram gönderisi"
+                            referrerPolicy="no-referrer"
+                            className="h-12 w-12 rounded object-cover shrink-0 bg-slate-100"
+                          />
+                          <div className="flex-1 space-y-1.5">
+                            <input
+                              type="text"
+                              disabled={readOnly}
+                              value={post.caption ?? ''}
+                              onChange={(e) => {
+                                const next = (safePage.instagram_posts ?? []).map((p) =>
+                                  p.id === post.id ? { ...p, caption: e.target.value } : p
+                                );
+                                updatePage({ instagram_posts: next });
+                              }}
+                              placeholder="Gönderi açıklaması (opsiyonel)"
+                              className="w-full rounded border border-slate-200 px-2 py-1 text-xs"
+                            />
+                            <input
+                              type="url"
+                              disabled={readOnly}
+                              value={post.post_url ?? ''}
+                              onChange={(e) => {
+                                const next = (safePage.instagram_posts ?? []).map((p) =>
+                                  p.id === post.id ? { ...p, post_url: e.target.value } : p
+                                );
+                                updatePage({ instagram_posts: next });
+                              }}
+                              placeholder="Gönderi linki (https://instagram.com/p/...)"
+                              className="w-full rounded border border-slate-200 px-2 py-1 text-[11px]"
+                            />
+                          </div>
+                          {!readOnly && (
+                            <button
+                              type="button"
+                              onClick={() => removeInstagramPost(post.id)}
+                              className="rounded border border-red-200 p-1.5 text-red-600 hover:bg-red-50"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {tab === 'sections' && (
                 <>
                   <div>
@@ -608,8 +925,9 @@ export default function BookingDesignEditorPage() {
                           ['hero', 'Kapak Görseli ve İşletme Tanıtımı'],
                           ['services', 'Hizmetler ve Fiyatlar'],
                           ['staff', 'Personel / Ekip Bölümü'],
+                          ['instagram', 'Instagram Profil Kartı & Son 6 Gönderi'],
                           ['gallery', 'İşletme Fotoğraf Galerisi'],
-                          ['reviews', 'Müşteri Yorumları Bölümü'],
+                          ['reviews', 'Puanlama Özeti ve Müşteri Yorumları'],
                           ['hours', 'Çalışma Saatleri Tablosu'],
                           ['contact', 'İletişim ve Harita Bilgileri'],
                         ] as Array<[keyof BookingSectionVisibility, string]>
@@ -622,7 +940,7 @@ export default function BookingDesignEditorPage() {
                           <input
                             type="checkbox"
                             disabled={readOnly}
-                            checked={safePage.section_visibility[key]}
+                            checked={Boolean(safePage.section_visibility[key])}
                             onChange={() => toggleSection(key)}
                             className="h-4 w-4 rounded border-slate-300"
                           />
@@ -698,7 +1016,9 @@ export default function BookingDesignEditorPage() {
                     />
                   </div>
                   <div>
-                    <label className="block font-semibold text-slate-700">Instagram Hesabı veya URL</label>
+                    <label className="block font-semibold text-slate-700">
+                      Instagram Hesabı veya URL
+                    </label>
                     <input
                       type="text"
                       disabled={readOnly}
@@ -739,7 +1059,9 @@ export default function BookingDesignEditorPage() {
           {/* Sağ Canlı Önizleme */}
           <div className="xl:col-span-7 flex flex-col items-center rounded-xl border border-slate-200 bg-slate-100 p-4">
             <div className="mb-3 flex w-full items-center justify-between text-xs text-slate-500 px-1">
-              <span>Canlı Ön İzleme ({previewDevice === 'mobile' ? 'Mobil Görünüm' : 'Masaüstü Görünüm'})</span>
+              <span>
+                Canlı Ön İzleme ({previewDevice === 'mobile' ? 'Mobil Görünüm' : 'Masaüstü Görünüm'})
+              </span>
               <span className="font-mono">/r/{safePage.slug}</span>
             </div>
 

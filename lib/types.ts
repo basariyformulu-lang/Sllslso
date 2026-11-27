@@ -206,6 +206,13 @@ export interface BookingGalleryItem {
   sort_order: number;
 }
 
+export interface BookingInstagramPost {
+  id: string;
+  image_url: string;
+  caption?: string;
+  post_url?: string;
+}
+
 export interface BookingBusinessHour {
   day: number;
   label: string;
@@ -218,6 +225,7 @@ export interface BookingSectionVisibility {
   hero: boolean;
   services: boolean;
   staff: boolean;
+  instagram: boolean;
   gallery: boolean;
   reviews: boolean;
   hours: boolean;
@@ -238,6 +246,12 @@ export interface BookingPage {
   address: string;
   map_location: string;
   instagram_url: string;
+  instagram_username: string;
+  instagram_display_name: string;
+  instagram_avatar_url: string;
+  instagram_followers_count: number;
+  instagram_posts_count: number;
+  instagram_posts: BookingInstagramPost[];
   theme_preset: 'classic_navy' | 'botanical_emerald' | 'warm_atelier' | 'minimal_mono' | 'soft_rose';
   primary_color: string;
   secondary_color: string;
@@ -313,15 +327,6 @@ export interface StaffLeave {
   created_at: string;
 }
 
-export interface CustomerAccount {
-  user_id: string;
-  first_name: string;
-  last_name: string;
-  phone: string;
-  email: string;
-  created_at: string;
-}
-
 export interface BookingCustomer {
   id: string;
   business_id: string;
@@ -329,6 +334,7 @@ export interface BookingCustomer {
   first_name: string;
   last_name: string;
   phone: string;
+  phone_normalized?: string;
   email: string;
   notes: string;
   is_active: boolean;
@@ -347,6 +353,9 @@ export interface Appointment {
   business_id: string;
   booking_customer_id: string;
   customer_user_id: string | null;
+  customer_name?: string;
+  customer_phone?: string;
+  customer_phone_normalized?: string;
   service_id: string | null;
   staff_id: string | null;
   service_name_snapshot: string;
@@ -400,7 +409,8 @@ export interface AppointmentReview {
   id: string;
   business_id: string;
   appointment_id: string;
-  customer_user_id: string;
+  customer_user_id: string | null;
+  customer_phone_normalized?: string;
   service_id: string | null;
   staff_id: string | null;
   rating: number;
@@ -423,6 +433,7 @@ export interface AppointmentNotification {
   appointment_id: string | null;
   recipient_type: 'business' | 'customer';
   recipient_user_id: string | null;
+  recipient_phone?: string;
   notification_type: string;
   channel: string;
   title: string;
@@ -431,4 +442,3 @@ export interface AppointmentNotification {
   is_read: boolean;
   created_at: string;
 }
-

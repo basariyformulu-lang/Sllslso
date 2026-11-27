@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessBookingContext } from '@/lib/auth-server';
 import { sanitizeExternalUrl, TR_WEEKDAYS } from '@/lib/booking-helpers';
+import { execute, query, queryOne, toBool, toIsoString, toMySqlDateTime, uuid } from '@/lib/db';
 
 const workingHourInputSchema = z.object({
   day_of_week: z.number().int().min(0).max(6),
@@ -58,55 +59,75 @@ const patchStaffSchema = z.discriminatedUnion('action', [
 ]);
 
 export async function GET() {
-  const { error, ctx, db, readOnly } = await requireBusinessBookingContext('booking.view', true);
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx, readOnly } = await requireBusinessBookingContext('booking.view', true);
+  if (error || !ctx || !ctx.business) return error!;
 
   const businessId = ctx.business.id;
-  const [
-    { data: staff },
-    { data: services },
-    { data: staffServices },
-    { data: workingHours },
-    { data: breaks },
-    { data: leaves },
-  ] = await Promise.all([
-    db
-      .from('booking_staff')
-      .select('*')
-      .eq('business_id', businessId)
-      .order('sort_order', { ascending: true })
-      .order('created_at', { ascending: true }),
-    db
-      .from('booking_services')
-      .select('id, name, price, discount_price, duration_minutes, is_active')
-      .eq('business_id', businessId)
-      .order('sort_order', { ascending: true }),
-    db.from('staff_services').select('staff_id, service_id').eq('business_id', businessId),
-    db.from('staff_working_hours').select('*').eq('business_id', businessId),
-    db.from('staff_breaks').select('*').eq('business_id', businessId).order('start_time', { ascending: true }),
-    db.from('staff_leaves').select('*').eq('business_id', businessId).order('start_date', { ascending: false }),
+  const [staff, services, staffServices, workingHours, breaks, leaves] = await Promise.all([
+    query<Record<string, unknown>>(
+      'SELECT * FROM booking_staff WHERE business_id = ? ORDER BY sort_order ASC, created_at ASC',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT id, name, price, discount_price, duration_minutes, is_active FROM booking_services WHERE business_id = ? ORDER BY sort_order ASC',
+      [businessId]
+    ),
+    query<{ staff_id: string; service_id: string }>(
+      'SELECT staff_id, service_id FROM staff_services WHERE business_id = ?',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM staff_working_hours WHERE business_id = ?',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM staff_breaks WHERE business_id = ? ORDER BY start_time ASC',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM staff_leaves WHERE business_id = ? ORDER BY start_date DESC',
+      [businessId]
+    ),
   ]);
 
-  const enrichedStaff = (staff ?? []).map((st) => ({
+  const enrichedStaff = staff.map((st) => ({
     ...st,
-    service_ids: (staffServices ?? [])
-      .filter((ss) => ss.staff_id === st.id)
-      .map((ss) => ss.service_id),
-    working_hours: (workingHours ?? []).filter((wh) => wh.staff_id === st.id),
-    breaks: (breaks ?? []).filter((br) => br.staff_id === st.id),
+    is_active: toBool(st.is_active),
+    created_at: toIsoString(st.created_at),
+    service_ids: staffServices.filter((ss) => ss.staff_id === st.id).map((ss) => ss.service_id),
+    working_hours: workingHours
+      .filter((wh) => wh.staff_id === st.id)
+      .map((wh) => ({
+        ...wh,
+        is_working: toBool(wh.is_working),
+        start_time: String(wh.start_time).slice(0, 5),
+        end_time: String(wh.end_time).slice(0, 5),
+      })),
+    breaks: breaks
+      .filter((br) => br.staff_id === st.id)
+      .map((br) => ({
+        ...br,
+        start_time: String(br.start_time).slice(0, 5),
+        end_time: String(br.end_time).slice(0, 5),
+      })),
   }));
 
   return NextResponse.json({
     readOnly,
     staff: enrichedStaff,
-    services: services ?? [],
-    leaves: leaves ?? [],
+    services: services.map((s) => ({
+      ...s,
+      price: Number(s.price),
+      discount_price: s.discount_price !== null ? Number(s.discount_price) : null,
+      is_active: toBool(s.is_active),
+    })),
+    leaves: leaves.map((l) => ({ ...l, created_at: toIsoString(l.created_at) })),
   });
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.staff');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.staff');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -125,74 +146,86 @@ export async function POST(req: NextRequest) {
 
   const d = parsed.data;
   const businessId = ctx.business.id;
+  const cntRow = await queryOne<{ cnt: number }>(
+    'SELECT COUNT(*) AS cnt FROM booking_staff WHERE business_id = ?',
+    [businessId]
+  );
 
-  const { count } = await db
-    .from('booking_staff')
-    .select('id', { count: 'exact', head: true })
-    .eq('business_id', businessId);
+  const staffId = uuid();
+  const nowStr = toMySqlDateTime();
+  await execute(
+    `INSERT INTO booking_staff
+     (id, business_id, full_name, avatar_url, specialties, bio, is_active, sort_order, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      staffId,
+      businessId,
+      d.fullName,
+      sanitizeExternalUrl(d.avatarUrl) ?? '',
+      d.specialties,
+      d.bio,
+      d.isActive ? 1 : 0,
+      Number(cntRow?.cnt ?? 0),
+      nowStr,
+      nowStr,
+    ]
+  );
 
-  const { data: created, error: createErr } = await db
-    .from('booking_staff')
-    .insert({
-      business_id: businessId,
-      full_name: d.fullName,
-      avatar_url: sanitizeExternalUrl(d.avatarUrl) ?? '',
-      specialties: d.specialties,
-      bio: d.bio,
-      is_active: d.isActive,
-      sort_order: count ?? 0,
-    })
-    .select('*')
-    .single();
+  const whSource =
+    d.workingHours && d.workingHours.length > 0
+      ? d.workingHours
+      : TR_WEEKDAYS.map((day) => ({
+          day_of_week: day.day,
+          is_working: day.day !== 0,
+          start_time: day.day === 0 ? '10:00' : '09:00',
+          end_time: day.day === 0 ? '17:00' : '19:00',
+        }));
 
-  if (createErr || !created) {
-    return NextResponse.json({ error: createErr?.message ?? 'Personel eklenemedi.' }, { status: 500 });
+  for (const wh of whSource) {
+    await execute(
+      `INSERT INTO staff_working_hours (id, business_id, staff_id, day_of_week, is_working, start_time, end_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        uuid(),
+        businessId,
+        staffId,
+        wh.day_of_week,
+        wh.is_working ? 1 : 0,
+        `${wh.start_time}:00`,
+        `${wh.end_time}:00`,
+      ]
+    );
   }
 
-  // Çalışma saatleri
-  const whRows = (d.workingHours && d.workingHours.length > 0
-    ? d.workingHours
-    : TR_WEEKDAYS.map((day) => ({
-        day_of_week: day.day,
-        is_working: day.day !== 0,
-        start_time: day.day === 0 ? '10:00' : '09:00',
-        end_time: day.day === 0 ? '17:00' : '19:00',
-      }))
-  ).map((wh) => ({
-    business_id: businessId,
-    staff_id: created.id,
-    day_of_week: wh.day_of_week,
-    is_working: wh.is_working,
-    start_time: wh.start_time,
-    end_time: wh.end_time,
-  }));
-
-  await db.from('staff_working_hours').insert(whRows);
-
   if (d.serviceIds.length > 0) {
-    const { data: validServices } = await db
-      .from('booking_services')
-      .select('id')
-      .eq('business_id', businessId)
-      .in('id', d.serviceIds);
-    const validIds = (validServices ?? []).map((s) => s.id);
-    if (validIds.length > 0) {
-      await db.from('staff_services').insert(
-        validIds.map((serviceId) => ({
-          business_id: businessId,
-          staff_id: created.id,
-          service_id: serviceId,
-        }))
-      );
+    const allServices = await query<{ id: string }>(
+      'SELECT id FROM booking_services WHERE business_id = ?',
+      [businessId]
+    );
+    const allowed = new Set(allServices.map((s) => s.id));
+    for (const serviceId of d.serviceIds) {
+      if (allowed.has(serviceId)) {
+        await execute(
+          'INSERT IGNORE INTO staff_services (business_id, staff_id, service_id) VALUES (?, ?, ?)',
+          [businessId, staffId, serviceId]
+        );
+      }
     }
   }
 
-  return NextResponse.json({ staff: created }, { status: 201 });
+  const created = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM booking_staff WHERE id = ? LIMIT 1',
+    [staffId]
+  );
+  return NextResponse.json(
+    { staff: created ? { ...created, is_active: toBool(created.is_active) } : null },
+    { status: 201 }
+  );
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.staff');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.staff');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -211,132 +244,151 @@ export async function PATCH(req: NextRequest) {
 
   const d = parsed.data;
   const businessId = ctx.business.id;
+  const nowStr = toMySqlDateTime();
 
   if (d.action === 'add_break') {
     if (d.endTime <= d.startTime) {
-      return NextResponse.json({ error: 'Mola bitiş saati başlangıçtan sonra olmalıdır.' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'Mola bitiş saati başlangıçtan sonra olmalıdır.' },
+        { status: 400 }
+      );
     }
-    const { data: br, error: err } = await db
-      .from('staff_breaks')
-      .insert({
-        business_id: businessId,
-        staff_id: d.staffId,
-        day_of_week: d.dayOfWeek ?? null,
-        title: d.title,
-        start_time: d.startTime,
-        end_time: d.endTime,
-      })
-      .select('*')
-      .single();
-    if (err) return NextResponse.json({ error: err.message }, { status: 500 });
+    const id = uuid();
+    await execute(
+      `INSERT INTO staff_breaks (id, business_id, staff_id, day_of_week, title, start_time, end_time, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, businessId, d.staffId, d.dayOfWeek ?? null, d.title, `${d.startTime}:00`, `${d.endTime}:00`, nowStr]
+    );
+    const br = await queryOne<Record<string, unknown>>(
+      'SELECT * FROM staff_breaks WHERE id = ? LIMIT 1',
+      [id]
+    );
     return NextResponse.json({ breakItem: br }, { status: 201 });
   }
 
   if (d.action === 'delete_break') {
-    await db.from('staff_breaks').delete().eq('id', d.breakId).eq('business_id', businessId);
+    await execute('DELETE FROM staff_breaks WHERE id = ? AND business_id = ?', [
+      d.breakId,
+      businessId,
+    ]);
     return NextResponse.json({ success: true });
   }
 
   if (d.action === 'add_leave') {
     if (d.endDate < d.startDate) {
-      return NextResponse.json({ error: 'Bitiş tarihi başlangıç tarihinden önce olamaz.' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'Bitiş tarihi başlangıç tarihinden önce olamaz.' },
+        { status: 400 }
+      );
     }
-    const { data: lv, error: err } = await db
-      .from('staff_leaves')
-      .insert({
-        business_id: businessId,
-        staff_id: d.staffId ?? null,
-        start_date: d.startDate,
-        end_date: d.endDate,
-        reason: d.reason,
-      })
-      .select('*')
-      .single();
-    if (err) return NextResponse.json({ error: err.message }, { status: 500 });
+    const id = uuid();
+    await execute(
+      `INSERT INTO staff_leaves (id, business_id, staff_id, start_date, end_date, reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, businessId, d.staffId ?? null, d.startDate, d.endDate, d.reason, nowStr]
+    );
+    const lv = await queryOne<Record<string, unknown>>(
+      'SELECT * FROM staff_leaves WHERE id = ? LIMIT 1',
+      [id]
+    );
     return NextResponse.json({ leave: lv }, { status: 201 });
   }
 
   if (d.action === 'delete_leave') {
-    await db.from('staff_leaves').delete().eq('id', d.leaveId).eq('business_id', businessId);
+    await execute('DELETE FROM staff_leaves WHERE id = ? AND business_id = ?', [
+      d.leaveId,
+      businessId,
+    ]);
     return NextResponse.json({ success: true });
   }
 
-  const { data: updated, error: updErr } = await db
-    .from('booking_staff')
-    .update({
-      full_name: d.fullName,
-      avatar_url: sanitizeExternalUrl(d.avatarUrl) ?? '',
-      specialties: d.specialties,
-      bio: d.bio,
-      is_active: d.isActive,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', d.id)
-    .eq('business_id', businessId)
-    .select('*')
-    .maybeSingle();
+  const res = await execute(
+    `UPDATE booking_staff
+     SET full_name = ?, avatar_url = ?, specialties = ?, bio = ?, is_active = ?, updated_at = ?
+     WHERE id = ? AND business_id = ?`,
+    [
+      d.fullName,
+      sanitizeExternalUrl(d.avatarUrl) ?? '',
+      d.specialties,
+      d.bio,
+      d.isActive ? 1 : 0,
+      nowStr,
+      d.id,
+      businessId,
+    ]
+  );
 
-  if (updErr || !updated) {
+  if (res.affectedRows === 0) {
     return NextResponse.json({ error: 'Personel güncellenemedi.' }, { status: 400 });
   }
 
   if (d.serviceIds !== undefined) {
-    await db.from('staff_services').delete().eq('business_id', businessId).eq('staff_id', d.id);
+    await execute('DELETE FROM staff_services WHERE business_id = ? AND staff_id = ?', [
+      businessId,
+      d.id,
+    ]);
     if (d.serviceIds.length > 0) {
-      const { data: validServices } = await db
-        .from('booking_services')
-        .select('id')
-        .eq('business_id', businessId)
-        .in('id', d.serviceIds);
-      const validIds = (validServices ?? []).map((s) => s.id);
-      if (validIds.length > 0) {
-        await db.from('staff_services').insert(
-          validIds.map((serviceId) => ({
-            business_id: businessId,
-            staff_id: d.id,
-            service_id: serviceId,
-          }))
-        );
+      const allServices = await query<{ id: string }>(
+        'SELECT id FROM booking_services WHERE business_id = ?',
+        [businessId]
+      );
+      const allowed = new Set(allServices.map((s) => s.id));
+      for (const serviceId of d.serviceIds) {
+        if (allowed.has(serviceId)) {
+          await execute(
+            'INSERT IGNORE INTO staff_services (business_id, staff_id, service_id) VALUES (?, ?, ?)',
+            [businessId, d.id, serviceId]
+          );
+        }
       }
     }
   }
 
   if (d.workingHours && d.workingHours.length > 0) {
     for (const wh of d.workingHours) {
-      await db
-        .from('staff_working_hours')
-        .upsert(
-          {
-            business_id: businessId,
-            staff_id: d.id,
-            day_of_week: wh.day_of_week,
-            is_working: wh.is_working,
-            start_time: wh.start_time,
-            end_time: wh.end_time,
-          },
-          { onConflict: 'staff_id,day_of_week' }
-        );
+      await execute(
+        `INSERT INTO staff_working_hours (id, business_id, staff_id, day_of_week, is_working, start_time, end_time)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           is_working = VALUES(is_working),
+           start_time = VALUES(start_time),
+           end_time = VALUES(end_time)`,
+        [
+          uuid(),
+          businessId,
+          d.id,
+          wh.day_of_week,
+          wh.is_working ? 1 : 0,
+          `${wh.start_time}:00`,
+          `${wh.end_time}:00`,
+        ]
+      );
     }
   }
 
-  return NextResponse.json({ staff: updated });
+  const updated = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM booking_staff WHERE id = ? LIMIT 1',
+    [d.id]
+  );
+  return NextResponse.json({
+    staff: updated ? { ...updated, is_active: toBool(updated.is_active) } : null,
+  });
 }
 
 export async function DELETE(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.staff');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.staff');
+  if (error || !ctx || !ctx.business) return error!;
 
   const { searchParams } = new URL(req.url);
   const id = searchParams.get('id');
   if (!id) return NextResponse.json({ error: 'Personel kimliği gerekli.' }, { status: 400 });
 
-  const { count } = await db
-    .from('appointments')
-    .select('id', { count: 'exact', head: true })
-    .eq('business_id', ctx.business.id)
-    .eq('staff_id', id);
+  const cntRow = await queryOne<{ cnt: number }>(
+    'SELECT COUNT(*) AS cnt FROM appointments WHERE business_id = ? AND staff_id = ?',
+    [ctx.business.id, id]
+  );
 
-  if ((count ?? 0) > 0) {
+  if (Number(cntRow?.cnt ?? 0) > 0) {
     return NextResponse.json(
       {
         error:
@@ -346,12 +398,9 @@ export async function DELETE(req: NextRequest) {
     );
   }
 
-  const { error: delErr } = await db
-    .from('booking_staff')
-    .delete()
-    .eq('id', id)
-    .eq('business_id', ctx.business.id);
-  if (delErr) return NextResponse.json({ error: delErr.message }, { status: 500 });
-
+  await execute('DELETE FROM booking_staff WHERE id = ? AND business_id = ?', [
+    id,
+    ctx.business.id,
+  ]);
   return NextResponse.json({ success: true });
 }

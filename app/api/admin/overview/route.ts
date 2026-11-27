@@ -1,22 +1,41 @@
 import { NextResponse } from 'next/server';
 import { requireSystemAdmin } from '@/lib/auth-server';
+import { parseJsonField, query, toBool, toIsoString } from '@/lib/db';
 import { getIstanbulMonthBounds, roundCurrency } from '@/lib/format';
 
 export async function GET() {
-  const { error, db } = await requireSystemAdmin();
-  if (error || !db) return error!;
+  const { error } = await requireSystemAdmin();
+  if (error) return error;
 
   const { start: monthStart, end: monthEnd } = getIstanbulMonthBounds();
   const now = new Date();
   const sevenDaysLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-  const [{ data: businesses }, { data: paymentRequests }] = await Promise.all([
-    db.from('businesses').select('*').order('created_at', { ascending: false }),
-    db.from('payment_requests').select('*').order('created_at', { ascending: false }),
+  const [businessesRaw, paymentRequestsRaw] = await Promise.all([
+    query<Record<string, unknown>>('SELECT * FROM businesses ORDER BY created_at DESC'),
+    query<Record<string, unknown>>('SELECT * FROM payment_requests ORDER BY created_at DESC'),
   ]);
 
-  const bizList = businesses ?? [];
-  const reqList = paymentRequests ?? [];
+  const bizList = businessesRaw.map((b) => ({
+    ...b,
+    id: String(b.id),
+    name: String(b.name),
+    is_active: toBool(b.is_active),
+    subscription_status: String(b.subscription_status),
+    subscription_start_at: toIsoString(b.subscription_start_at),
+    subscription_end_at: toIsoString(b.subscription_end_at),
+    created_at: toIsoString(b.created_at) ?? '',
+  }));
+
+  const reqList = paymentRequestsRaw.map((r) => ({
+    ...r,
+    id: String(r.id),
+    amount: Number(r.amount ?? 0),
+    payment_date: String(r.payment_date ?? ''),
+    status: String(r.status),
+    bank_snapshot: parseJsonField(r.bank_snapshot, {}),
+    created_at: toIsoString(r.created_at) ?? '',
+  }));
 
   const totalBusinesses = bizList.length;
   const activeBusinesses = bizList.filter((b) => b.is_active && b.subscription_status === 'active').length;
@@ -63,7 +82,6 @@ export async function GET() {
       new Date(b.subscription_end_at) <= sevenDaysLater
   );
 
-  // Son 6 ay grafik verisi (Europe/Istanbul)
   const monthlySeries: Array<{
     key: string;
     label: string;

@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireSystemAdmin } from '@/lib/auth-server';
+import {
+  execute,
+  query,
+  queryOne,
+  toBool,
+  toIsoString,
+  toMySqlDateTime,
+  uuid,
+  writeAuditLog,
+} from '@/lib/db';
 
 const createBankSchema = z.object({
   bankName: z.string().trim().min(2, 'Banka adı giriniz.').max(100),
@@ -22,22 +32,26 @@ const updateBankSchema = z.object({
 });
 
 export async function GET() {
-  const { error, db } = await requireSystemAdmin();
-  if (error || !db) return error!;
+  const { error } = await requireSystemAdmin();
+  if (error) return error;
 
-  const { data: accounts, error: err } = await db
-    .from('bank_accounts')
-    .select('*')
-    .order('is_default', { ascending: false })
-    .order('created_at', { ascending: false });
+  const accounts = await query<Record<string, unknown>>(
+    'SELECT * FROM bank_accounts ORDER BY is_default DESC, created_at DESC'
+  );
 
-  if (err) return NextResponse.json({ error: err.message }, { status: 500 });
-  return NextResponse.json({ bankAccounts: accounts ?? [] });
+  return NextResponse.json({
+    bankAccounts: accounts.map((a) => ({
+      ...a,
+      is_active: toBool(a.is_active),
+      is_default: toBool(a.is_default),
+      created_at: toIsoString(a.created_at),
+    })),
+  });
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireSystemAdmin();
-  if (error || !ctx || !db) return error!;
+  const { error, ctx } = await requireSystemAdmin();
+  if (error || !ctx) return error!;
 
   let body: unknown;
   try {
@@ -56,41 +70,59 @@ export async function POST(req: NextRequest) {
 
   const d = parsed.data;
   if (d.isDefault) {
-    await db.from('bank_accounts').update({ is_default: false }).eq('is_default', true);
+    await execute('UPDATE bank_accounts SET is_default = 0 WHERE is_default = 1');
   }
 
-  const { data: created, error: insertErr } = await db
-    .from('bank_accounts')
-    .insert({
-      bank_name: d.bankName,
-      iban: d.iban.toUpperCase(),
-      account_holder: d.accountHolder,
-      description: d.description,
-      is_active: d.isActive,
-      is_default: d.isDefault,
-    })
-    .select('*')
-    .single();
+  const id = uuid();
+  const nowStr = toMySqlDateTime();
+  await execute(
+    `INSERT INTO bank_accounts (id, bank_name, iban, account_holder, description, is_active, is_default, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      d.bankName,
+      d.iban.toUpperCase(),
+      d.accountHolder,
+      d.description,
+      d.isActive ? 1 : 0,
+      d.isDefault ? 1 : 0,
+      nowStr,
+    ]
+  );
 
-  if (insertErr) return NextResponse.json({ error: insertErr.message }, { status: 500 });
+  const created = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM bank_accounts WHERE id = ? LIMIT 1',
+    [id]
+  );
 
-  await db.from('audit_logs').insert({
+  await writeAuditLog({
     scope: 'admin',
-    actor_user_id: ctx.userId,
-    actor_name: ctx.adminName ?? 'Sistem Yöneticisi',
+    actorUserId: ctx.userId,
+    actorName: ctx.adminName ?? 'Sistem Yöneticisi',
     action: 'bank_account_created',
-    entity_type: 'bank_accounts',
-    entity_id: created.id,
-    new_values: { bank_name: created.bank_name, iban: created.iban },
-    description: `Yeni banka hesabı eklendi: ${created.bank_name}`,
+    entityType: 'bank_accounts',
+    entityId: id,
+    newValues: { bank_name: d.bankName, iban: d.iban.toUpperCase() },
+    description: `Yeni banka hesabı eklendi: ${d.bankName}`,
   });
 
-  return NextResponse.json({ bankAccount: created }, { status: 201 });
+  return NextResponse.json(
+    {
+      bankAccount: created
+        ? {
+            ...created,
+            is_active: toBool(created.is_active),
+            is_default: toBool(created.is_default),
+          }
+        : null,
+    },
+    { status: 201 }
+  );
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireSystemAdmin();
-  if (error || !ctx || !db) return error!;
+  const { error, ctx } = await requireSystemAdmin();
+  if (error || !ctx) return error!;
 
   let body: unknown;
   try {
@@ -105,46 +137,56 @@ export async function PATCH(req: NextRequest) {
   }
 
   const d = parsed.data;
-  const { data: existing } = await db
-    .from('bank_accounts')
-    .select('*')
-    .eq('id', d.id)
-    .maybeSingle();
+  const existing = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM bank_accounts WHERE id = ? LIMIT 1',
+    [d.id]
+  );
 
   if (!existing) return NextResponse.json({ error: 'Banka hesabı bulunamadı.' }, { status: 404 });
 
   if (d.isDefault === true) {
-    await db.from('bank_accounts').update({ is_default: false }).eq('is_default', true);
+    await execute('UPDATE bank_accounts SET is_default = 0 WHERE is_default = 1');
   }
 
-  const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
-  if (d.bankName !== undefined) patch.bank_name = d.bankName;
-  if (d.iban !== undefined) patch.iban = d.iban.toUpperCase();
-  if (d.accountHolder !== undefined) patch.account_holder = d.accountHolder;
-  if (d.description !== undefined) patch.description = d.description;
-  if (d.isActive !== undefined) patch.is_active = d.isActive;
-  if (d.isDefault !== undefined) patch.is_default = d.isDefault;
+  await execute(
+    `UPDATE bank_accounts
+     SET bank_name = ?, iban = ?, account_holder = ?, description = ?, is_active = ?, is_default = ?
+     WHERE id = ?`,
+    [
+      d.bankName ?? String(existing.bank_name),
+      (d.iban ?? String(existing.iban)).toUpperCase(),
+      d.accountHolder ?? String(existing.account_holder),
+      d.description ?? String(existing.description ?? ''),
+      d.isActive !== undefined ? (d.isActive ? 1 : 0) : toBool(existing.is_active) ? 1 : 0,
+      d.isDefault !== undefined ? (d.isDefault ? 1 : 0) : toBool(existing.is_default) ? 1 : 0,
+      d.id,
+    ]
+  );
 
-  const { data: updated, error: updErr } = await db
-    .from('bank_accounts')
-    .update(patch)
-    .eq('id', d.id)
-    .select('*')
-    .single();
+  const updated = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM bank_accounts WHERE id = ? LIMIT 1',
+    [d.id]
+  );
 
-  if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
-
-  await db.from('audit_logs').insert({
+  await writeAuditLog({
     scope: 'admin',
-    actor_user_id: ctx.userId,
-    actor_name: ctx.adminName ?? 'Sistem Yöneticisi',
+    actorUserId: ctx.userId,
+    actorName: ctx.adminName ?? 'Sistem Yöneticisi',
     action: 'bank_account_updated',
-    entity_type: 'bank_accounts',
-    entity_id: d.id,
-    old_values: { bank_name: existing.bank_name, iban: existing.iban, is_active: existing.is_active },
-    new_values: patch,
-    description: `Banka / IBAN bilgisi güncellendi: ${updated.bank_name}`,
+    entityType: 'bank_accounts',
+    entityId: d.id,
+    oldValues: { bank_name: existing.bank_name, iban: existing.iban },
+    newValues: d,
+    description: `Banka / IBAN bilgisi güncellendi: ${String(updated?.bank_name ?? d.bankName ?? '')}`,
   });
 
-  return NextResponse.json({ bankAccount: updated });
+  return NextResponse.json({
+    bankAccount: updated
+      ? {
+          ...updated,
+          is_active: toBool(updated.is_active),
+          is_default: toBool(updated.is_default),
+        }
+      : null,
+  });
 }

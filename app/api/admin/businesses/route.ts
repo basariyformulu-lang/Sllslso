@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireSystemAdmin } from '@/lib/auth-server';
+import {
+  execute,
+  query,
+  queryOne,
+  toBool,
+  toIsoString,
+  toMySqlDateTime,
+  withTransaction,
+  writeAuditLog,
+} from '@/lib/db';
 import { roundCurrency } from '@/lib/format';
 
 const updateBusinessSchema = z.object({
@@ -26,37 +36,57 @@ const deleteBusinessSchema = z.object({
 });
 
 export async function GET() {
-  const { error, db } = await requireSystemAdmin();
-  if (error || !db) return error!;
+  const { error } = await requireSystemAdmin();
+  if (error) return error;
 
-  const [{ data: businesses }, { data: owners }, { data: subscriptions }, { data: payments }] =
-    await Promise.all([
-      db.from('businesses').select('*').order('created_at', { ascending: false }),
-      db
-        .from('business_members')
-        .select('business_id, user_id, profile:profiles(first_name, last_name, email, phone)')
-        .eq('is_owner', true),
-      db.from('subscriptions').select('*'),
-      db
-        .from('payment_requests')
-        .select('business_id, payment_date, status, amount')
-        .eq('status', 'approved')
-        .order('payment_date', { ascending: false }),
-    ]);
+  const [businesses, owners, subscriptions, payments] = await Promise.all([
+    query<Record<string, unknown>>('SELECT * FROM businesses ORDER BY created_at DESC'),
+    query<{
+      business_id: string;
+      user_id: string;
+      first_name: string | null;
+      last_name: string | null;
+      email: string | null;
+      phone: string | null;
+    }>(
+      `SELECT bm.business_id, bm.user_id, p.first_name, p.last_name, p.email, p.phone
+       FROM business_members bm
+       LEFT JOIN profiles p ON p.id = bm.user_id
+       WHERE bm.is_owner = 1`
+    ),
+    query<Record<string, unknown>>('SELECT * FROM subscriptions'),
+    query<{ business_id: string; payment_date: string; amount: number }>(
+      `SELECT business_id, payment_date, amount
+       FROM payment_requests
+       WHERE status = 'approved'
+       ORDER BY payment_date DESC`
+    ),
+  ]);
 
-  const enriched = (businesses ?? []).map((b) => {
-    const owner = (owners ?? []).find((o) => o.business_id === b.id);
-    const sub = (subscriptions ?? []).find((s) => s.business_id === b.id);
-    const lastPayment = (payments ?? []).find((p) => p.business_id === b.id);
-    const ownerProfile = Array.isArray(owner?.profile) ? owner?.profile[0] : owner?.profile;
+  const enriched = businesses.map((b) => {
+    const bizId = String(b.id);
+    const owner = owners.find((o) => o.business_id === bizId);
+    const sub = subscriptions.find((s) => String(s.business_id) === bizId) ?? null;
+    const lastPayment = payments.find((p) => p.business_id === bizId);
     return {
       ...b,
-      owner_name: ownerProfile
-        ? `${ownerProfile.first_name} ${ownerProfile.last_name}`.trim()
+      is_active: toBool(b.is_active),
+      booking_module_enabled: toBool(b.booking_module_enabled),
+      subscription_start_at: toIsoString(b.subscription_start_at),
+      subscription_end_at: toIsoString(b.subscription_end_at),
+      created_at: toIsoString(b.created_at),
+      owner_name: owner
+        ? `${owner.first_name ?? ''} ${owner.last_name ?? ''}`.trim() || '—'
         : '—',
-      owner_email: ownerProfile?.email ?? b.email,
-      subscription: sub ?? null,
-      last_payment_date: lastPayment?.payment_date ?? sub?.last_payment_at ?? null,
+      owner_email: owner?.email ?? String(b.email ?? ''),
+      subscription: sub
+        ? {
+            ...sub,
+            monthly_price: Number(sub.monthly_price ?? 0),
+            locked_price: Number(sub.monthly_price ?? 0),
+          }
+        : null,
+      last_payment_date: lastPayment?.payment_date ?? null,
     };
   });
 
@@ -64,8 +94,8 @@ export async function GET() {
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireSystemAdmin();
-  if (error || !ctx || !db) return error!;
+  const { error, ctx } = await requireSystemAdmin();
+  if (error || !ctx) return error!;
 
   let body: unknown;
   try {
@@ -80,87 +110,117 @@ export async function PATCH(req: NextRequest) {
   }
 
   const d = parsed.data;
-  const { data: existing } = await db
-    .from('businesses')
-    .select('*')
-    .eq('id', d.id)
-    .maybeSingle();
+  const existing = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM businesses WHERE id = ? LIMIT 1',
+    [d.id]
+  );
 
   if (!existing) {
     return NextResponse.json({ error: 'İşletme bulunamadı.' }, { status: 404 });
   }
 
-  let nextStart = d.subscriptionStartAt !== undefined ? d.subscriptionStartAt : existing.subscription_start_at;
-  let nextEnd = d.subscriptionEndAt !== undefined ? d.subscriptionEndAt : existing.subscription_end_at;
-  let nextSubStatus = d.subscriptionStatus ?? existing.subscription_status;
+  let nextStartIso =
+    d.subscriptionStartAt !== undefined
+      ? d.subscriptionStartAt
+      : toIsoString(existing.subscription_start_at);
+  let nextEndIso =
+    d.subscriptionEndAt !== undefined
+      ? d.subscriptionEndAt
+      : toIsoString(existing.subscription_end_at);
+  let nextSubStatus = d.subscriptionStatus ?? String(existing.subscription_status);
 
   if (d.extendDays) {
+    const existingEnd = toIsoString(existing.subscription_end_at);
     const baseDate =
-      existing.subscription_end_at && new Date(existing.subscription_end_at).getTime() > Date.now()
-        ? new Date(existing.subscription_end_at)
+      existingEnd && new Date(existingEnd).getTime() > Date.now()
+        ? new Date(existingEnd)
         : new Date();
-    if (!nextStart) nextStart = new Date().toISOString();
-    nextEnd = new Date(baseDate.getTime() + d.extendDays * 24 * 60 * 60 * 1000).toISOString();
+    if (!nextStartIso) nextStartIso = new Date().toISOString();
+    nextEndIso = new Date(baseDate.getTime() + d.extendDays * 24 * 60 * 60 * 1000).toISOString();
     nextSubStatus = 'active';
   }
 
-  const bizPatch: Record<string, unknown> = {
-    updated_at: new Date().toISOString(),
-    subscription_status: nextSubStatus,
-    subscription_start_at: nextStart,
-    subscription_end_at: nextEnd,
-  };
-  if (d.name !== undefined) bizPatch.name = d.name;
-  if (d.phone !== undefined) bizPatch.phone = d.phone;
-  if (d.email !== undefined) bizPatch.email = d.email;
-  if (d.address !== undefined) bizPatch.address = d.address;
-  if (d.isActive !== undefined) bizPatch.is_active = d.isActive;
+  const startSql = nextStartIso ? toMySqlDateTime(new Date(nextStartIso)) : null;
+  const endSql = nextEndIso ? toMySqlDateTime(new Date(nextEndIso)) : null;
+  const nowStr = toMySqlDateTime();
 
-  const { data: updated, error: updErr } = await db
-    .from('businesses')
-    .update(bizPatch)
-    .eq('id', d.id)
-    .select('*')
-    .single();
+  await withTransaction(async (conn) => {
+    await conn.execute(
+      `UPDATE businesses
+       SET name = ?, phone = ?, email = ?, address = ?, is_active = ?,
+           subscription_status = ?, subscription_start_at = ?, subscription_end_at = ?, updated_at = ?
+       WHERE id = ?`,
+      [
+        d.name ?? String(existing.name),
+        d.phone ?? String(existing.phone ?? ''),
+        d.email ?? String(existing.email ?? ''),
+        d.address ?? String(existing.address ?? ''),
+        d.isActive !== undefined ? (d.isActive ? 1 : 0) : toBool(existing.is_active) ? 1 : 0,
+        nextSubStatus,
+        startSql,
+        endSql,
+        nowStr,
+        d.id,
+      ]
+    );
 
-  if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
-
-  const subPatch: Record<string, unknown> = {
-    status: nextSubStatus,
-    start_date: nextStart,
-    end_date: nextEnd,
-    updated_by: ctx.userId,
-    updated_at: new Date().toISOString(),
-  };
-  if (d.lockedPrice !== undefined) subPatch.locked_price = roundCurrency(d.lockedPrice);
-
-  await db.from('subscriptions').update(subPatch).eq('business_id', d.id);
-
-  await db.from('audit_logs').insert({
-    scope: 'admin',
-    business_id: d.id,
-    actor_user_id: ctx.userId,
-    actor_name: ctx.adminName ?? 'Sistem Yöneticisi',
-    action: 'business_updated',
-    entity_type: 'businesses',
-    entity_id: d.id,
-    old_values: {
-      name: existing.name,
-      is_active: existing.is_active,
-      subscription_status: existing.subscription_status,
-      subscription_start_at: existing.subscription_start_at,
-      subscription_end_at: existing.subscription_end_at,
-    },
-    new_values: bizPatch,
-    description: d.actionNote || `${existing.name} işletmesi yönetici tarafından güncellendi.`,
+    if (d.lockedPrice !== undefined) {
+      await conn.execute(
+        `UPDATE subscriptions
+         SET status = ?, start_at = ?, end_at = ?, monthly_price = ?
+         WHERE business_id = ?`,
+        [nextSubStatus, startSql, endSql, roundCurrency(d.lockedPrice), d.id]
+      );
+    } else {
+      await conn.execute(
+        `UPDATE subscriptions SET status = ?, start_at = ?, end_at = ? WHERE business_id = ?`,
+        [nextSubStatus, startSql, endSql, d.id]
+      );
+    }
   });
 
-  return NextResponse.json({ business: updated });
+  const updated = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM businesses WHERE id = ? LIMIT 1',
+    [d.id]
+  );
+
+  await writeAuditLog({
+    scope: 'admin',
+    businessId: d.id,
+    actorUserId: ctx.userId,
+    actorName: ctx.adminName ?? 'Sistem Yöneticisi',
+    action: 'business_updated',
+    entityType: 'businesses',
+    entityId: d.id,
+    old_values: {
+      name: existing.name,
+      is_active: toBool(existing.is_active),
+      subscription_status: existing.subscription_status,
+    },
+    new_values: {
+      name: d.name ?? existing.name,
+      is_active: d.isActive ?? toBool(existing.is_active),
+      subscription_status: nextSubStatus,
+      subscription_end_at: nextEndIso,
+    },
+    description: d.actionNote || `${String(existing.name)} işletmesi yönetici tarafından güncellendi.`,
+  } as Parameters<typeof writeAuditLog>[0]);
+
+  return NextResponse.json({
+    business: updated
+      ? {
+          ...updated,
+          is_active: toBool(updated.is_active),
+          subscription_start_at: toIsoString(updated.subscription_start_at),
+          subscription_end_at: toIsoString(updated.subscription_end_at),
+        }
+      : null,
+  });
 }
 
 export async function DELETE(req: NextRequest) {
-  const { error, ctx, db } = await requireSystemAdmin();
-  if (error || !ctx || !db) return error!;
+  const { error, ctx } = await requireSystemAdmin();
+  if (error || !ctx) return error!;
 
   let body: unknown;
   try {
@@ -175,53 +235,36 @@ export async function DELETE(req: NextRequest) {
   }
 
   const { id, confirmName } = parsed.data;
-  const { data: biz } = await db.from('businesses').select('*').eq('id', id).maybeSingle();
+  const biz = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM businesses WHERE id = ? LIMIT 1',
+    [id]
+  );
   if (!biz) return NextResponse.json({ error: 'İşletme bulunamadı.' }, { status: 404 });
 
-  if (biz.name.trim() !== confirmName.trim()) {
+  if (String(biz.name).trim() !== confirmName.trim()) {
     return NextResponse.json(
       { error: 'Onay için yazdığınız işletme adı kayıtla eşleşmiyor.' },
       { status: 400 }
     );
   }
 
-  // Hukuki/denetim amaçlı finansal özet arşivi sakla
-  const [{ data: payments }, { data: incomes }, { data: expenses }, { data: sub }] =
-    await Promise.all([
-      db.from('payment_requests').select('*').eq('business_id', id),
-      db.from('income_transactions').select('id, title, amount, transaction_date').eq('business_id', id),
-      db.from('expense_transactions').select('id, title, amount, transaction_date').eq('business_id', id),
-      db.from('subscriptions').select('*').eq('business_id', id).maybeSingle(),
-    ]);
-
-  await db.from('deleted_business_archives').insert({
-    original_business_id: biz.id,
-    business_name: biz.name,
-    owner_email: biz.email,
-    deleted_by: ctx.userId,
-    snapshot: {
-      business: biz,
-      subscription: sub,
-      payment_requests: payments ?? [],
-      income_count: (incomes ?? []).length,
-      expense_count: (expenses ?? []).length,
-    },
-  });
-
-  await db.from('audit_logs').insert({
+  await writeAuditLog({
     scope: 'admin',
-    business_id: null,
-    actor_user_id: ctx.userId,
-    actor_name: ctx.adminName ?? 'Sistem Yöneticisi',
+    businessId: null,
+    actorUserId: ctx.userId,
+    actorName: ctx.adminName ?? 'Sistem Yöneticisi',
     action: 'business_deleted',
-    entity_type: 'businesses',
-    entity_id: biz.id,
-    old_values: { name: biz.name, business_code: biz.business_code, email: biz.email },
-    description: `${biz.name} işletmesi denetim arşivi alınarak kalıcı olarak silindi.`,
+    entityType: 'businesses',
+    entityId: id,
+    oldValues: {
+      name: biz.name,
+      business_code: biz.business_code,
+      email: biz.email,
+    },
+    description: `${String(biz.name)} işletmesi yönetici tarafından kalıcı olarak silindi.`,
   });
 
-  const { error: delErr } = await db.from('businesses').delete().eq('id', id);
-  if (delErr) return NextResponse.json({ error: delErr.message }, { status: 500 });
+  await execute('DELETE FROM businesses WHERE id = ?', [id]);
 
   return NextResponse.json({ success: true });
 }

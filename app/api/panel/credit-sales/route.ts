@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessContext } from '@/lib/auth-server';
+import {
+  query,
+  queryOne,
+  toBool,
+  toIsoString,
+  toMySqlDateTime,
+  uuid,
+  withTransaction,
+  writeAuditLog,
+} from '@/lib/db';
 import { addMonthsToISODate, getIstanbulTodayISO, roundCurrency } from '@/lib/format';
 
 const createCreditSaleSchema = z.object({
@@ -43,42 +53,61 @@ function computeCreditSaleStatus(
 }
 
 export async function GET() {
-  const { error, ctx, db } = await requireBusinessContext('credit_sales.view');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('credit_sales.view');
+  if (error || !ctx || !ctx.business) return error!;
 
   const today = getIstanbulTodayISO();
-  const [{ data: sales, error: salesErr }, { data: customers }] = await Promise.all([
-    db
-      .from('credit_sales')
-      .select('*, customer:customers(id, name, last_name, phone)')
-      .eq('business_id', ctx.business.id)
-      .order('due_date', { ascending: true }),
-    db
-      .from('customers')
-      .select('id, name, last_name, phone, is_active')
-      .eq('business_id', ctx.business.id)
-      .eq('is_active', true)
-      .order('name', { ascending: true }),
+  const [sales, customers] = await Promise.all([
+    query<Record<string, unknown>>(
+      `SELECT cs.*, c.name AS c_name, c.last_name AS c_last_name, c.phone AS c_phone
+       FROM credit_sales cs
+       LEFT JOIN customers c ON c.id = cs.customer_id
+       WHERE cs.business_id = ?
+       ORDER BY cs.due_date ASC`,
+      [ctx.business.id]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT id, name, last_name, phone, is_active FROM customers WHERE business_id = ? AND is_active = 1 ORDER BY name ASC',
+      [ctx.business.id]
+    ),
   ]);
 
-  if (salesErr) {
-    return NextResponse.json({ error: salesErr.message }, { status: 500 });
-  }
+  const enriched = sales.map((s) => {
+    const total = roundCurrency(Number(s.total_amount));
+    const paid = roundCurrency(Number(s.paid_amount));
+    const isCancelled = toBool(s.is_cancelled);
+    const dueDate = String(s.due_date ?? '');
+    return {
+      ...s,
+      is_cancelled: isCancelled,
+      total_amount: total,
+      paid_amount: paid,
+      remaining_amount: roundCurrency(Math.max(0, total - paid)),
+      created_at: toIsoString(s.created_at),
+      customer: s.c_name
+        ? {
+            id: String(s.customer_id),
+            name: String(s.c_name),
+            last_name: String(s.c_last_name ?? ''),
+            phone: String(s.c_phone ?? ''),
+          }
+        : undefined,
+      computed_status: computeCreditSaleStatus(
+        { total_amount: total, paid_amount: paid, due_date: dueDate, is_cancelled: isCancelled },
+        today
+      ),
+    };
+  });
 
-  const enriched = (sales ?? []).map((s) => ({
-    ...s,
-    total_amount: roundCurrency(s.total_amount),
-    paid_amount: roundCurrency(s.paid_amount),
-    remaining_amount: roundCurrency(Math.max(0, Number(s.total_amount) - Number(s.paid_amount))),
-    computed_status: computeCreditSaleStatus(s, today),
-  }));
-
-  return NextResponse.json({ creditSales: enriched, customers: customers ?? [] });
+  return NextResponse.json({
+    creditSales: enriched,
+    customers: customers.map((c) => ({ ...c, is_active: toBool(c.is_active) })),
+  });
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessContext('credit_sales.create');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('credit_sales.create');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -109,68 +138,77 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { data: customer } = await db
-    .from('customers')
-    .select('id, name, last_name')
-    .eq('id', d.customerId)
-    .eq('business_id', ctx.business.id)
-    .maybeSingle();
+  const customer = await queryOne<{ id: string; name: string; last_name: string }>(
+    'SELECT id, name, last_name FROM customers WHERE id = ? AND business_id = ? LIMIT 1',
+    [d.customerId, ctx.business.id]
+  );
 
   if (!customer) {
     return NextResponse.json({ error: 'Seçilen müşteri bulunamadı.' }, { status: 404 });
   }
 
   const totalAmount = roundCurrency(d.totalAmount);
+  const saleId = uuid();
+  const nowStr = toMySqlDateTime();
 
-  const { data: sale, error: saleErr } = await db
-    .from('credit_sales')
-    .insert({
-      business_id: ctx.business.id,
-      customer_id: d.customerId,
-      description: d.description,
-      total_amount: totalAmount,
-      paid_amount: 0,
-      sale_date: d.saleDate,
-      due_months: d.dueMonths ?? null,
-      due_date: computedDueDate,
-      notes: d.notes,
-      created_by: ctx.userId,
-    })
-    .select('*')
-    .single();
+  await withTransaction(async (conn) => {
+    await conn.execute(
+      `INSERT INTO credit_sales
+       (id, business_id, customer_id, description, total_amount, paid_amount, sale_date, due_months, due_date, notes, is_cancelled, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 0.00, ?, ?, ?, ?, 0, ?, ?, ?)`,
+      [
+        saleId,
+        ctx.business!.id,
+        d.customerId,
+        d.description,
+        totalAmount,
+        d.saleDate,
+        d.dueMonths ?? null,
+        computedDueDate,
+        d.notes,
+        ctx.userId,
+        nowStr,
+        nowStr,
+      ]
+    );
 
-  if (saleErr || !sale) {
-    return NextResponse.json({ error: saleErr?.message ?? 'Vadeli satış oluşturulamadı.' }, { status: 500 });
-  }
+    await conn.execute(
+      `INSERT INTO customer_transactions
+       (id, business_id, customer_id, credit_sale_id, transaction_type, debt_category, amount, signed_amount, transaction_date, due_date, description, notes, is_overpayment, is_cancelled, created_by, created_at)
+       VALUES (?, ?, ?, ?, 'debt', 'Vadeli Satış', ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`,
+      [
+        uuid(),
+        ctx.business!.id,
+        d.customerId,
+        saleId,
+        totalAmount,
+        totalAmount,
+        d.saleDate,
+        computedDueDate,
+        d.description,
+        d.notes,
+        ctx.userId,
+        nowStr,
+      ]
+    );
 
-  // Müşteri carisine otomatik borç hareketi ekle
-  const { error: txErr } = await db.from('customer_transactions').insert({
-    business_id: ctx.business.id,
-    customer_id: d.customerId,
-    credit_sale_id: sale.id,
-    transaction_type: 'debt',
-    debt_category: 'Vadeli Satış',
-    amount: totalAmount,
-    signed_amount: totalAmount,
-    transaction_date: d.saleDate,
-    due_date: computedDueDate,
-    description: d.description,
-    notes: d.notes,
-    created_by: ctx.userId,
+    await conn.execute(
+      `INSERT INTO notifications
+       (id, business_id, recipient_user_id, type, title, message, link, is_read, created_at)
+       VALUES (?, ?, NULL, 'credit_sale_created', 'Yeni Vadeli Satış Kaydedildi', ?, '/panel/vadeli-satislar', 0, ?)`,
+      [
+        uuid(),
+        ctx.business!.id,
+        `${customer.name} ${customer.last_name} için ${totalAmount.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL tutarında vadeli satış oluşturuldu (Vade: ${computedDueDate}).`,
+        nowStr,
+      ]
+    );
   });
 
-  if (txErr) {
-    await db.from('credit_sales').delete().eq('id', sale.id);
-    return NextResponse.json({ error: txErr.message }, { status: 500 });
-  }
-
-  await db.from('notifications').insert({
-    business_id: ctx.business.id,
-    type: 'credit_sale_created',
-    title: 'Yeni Vadeli Satış Kaydedildi',
-    message: `${customer.name} ${customer.last_name} için ${totalAmount.toLocaleString('tr-TR', { minimumFractionDigits: 2 })} TL tutarında vadeli satış oluşturuldu (Vade: ${computedDueDate}).`,
-    link: '/panel/vadeli-satislar',
-  });
+  const sale = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM credit_sales WHERE id = ? LIMIT 1',
+    [saleId]
+  );
 
   return NextResponse.json({ creditSale: sale }, { status: 201 });
 }
@@ -194,84 +232,96 @@ export async function PATCH(req: NextRequest) {
   const payload = parsed.data;
   const requiredPerm =
     payload.action === 'collect_payment' ? 'customers.add_payment' : 'credit_sales.delete';
-  const { error, ctx, db } = await requireBusinessContext(requiredPerm);
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext(requiredPerm);
+  if (error || !ctx || !ctx.business) return error!;
 
-  const { data: sale } = await db
-    .from('credit_sales')
-    .select('*')
-    .eq('id', payload.id)
-    .eq('business_id', ctx.business.id)
-    .maybeSingle();
+  const nowStr = toMySqlDateTime();
 
-  if (!sale || sale.is_cancelled) {
+  if (payload.action === 'collect_payment') {
+    const amt = roundCurrency(payload.amount);
+    try {
+      const newPaid = await withTransaction(async (conn) => {
+        const [rows] = await conn.execute(
+          'SELECT * FROM credit_sales WHERE id = ? AND business_id = ? FOR UPDATE',
+          [payload.id, ctx.business!.id]
+        );
+        const sale = (rows as Array<Record<string, unknown>>)[0];
+        if (!sale || toBool(sale.is_cancelled)) {
+          throw new Error('NOT_FOUND:Aktif vadeli satış bulunamadı.');
+        }
+
+        const remaining = roundCurrency(Number(sale.total_amount) - Number(sale.paid_amount));
+        if (amt > remaining) {
+          throw new Error(
+            `BAD:Tahsilat tutarı bu vadeli satışın kalan bakiyesinden (${remaining.toFixed(2)} TL) fazla olamaz.`
+          );
+        }
+
+        await conn.execute(
+          `INSERT INTO customer_transactions
+           (id, business_id, customer_id, credit_sale_id, transaction_type, debt_category, amount, signed_amount, transaction_date, payment_method, description, notes, is_overpayment, is_cancelled, created_by, created_at)
+           VALUES (?, ?, ?, ?, 'payment', 'Vadeli Satış Tahsilatı', ?, ?, ?, ?, ?, '', 0, 0, ?, ?)`,
+          [
+            uuid(),
+            ctx.business!.id,
+            String(sale.customer_id),
+            String(sale.id),
+            amt,
+            -amt,
+            payload.paymentDate,
+            payload.paymentMethod,
+            payload.description || `${String(sale.description)} tahsilatı`,
+            ctx.userId,
+            nowStr,
+          ]
+        );
+
+        const nextPaid = roundCurrency(Number(sale.paid_amount) + amt);
+        await conn.execute(
+          'UPDATE credit_sales SET paid_amount = ?, updated_at = ? WHERE id = ?',
+          [nextPaid, nowStr, String(sale.id)]
+        );
+        return nextPaid;
+      });
+
+      return NextResponse.json({ success: true, paidAmount: newPaid });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'İşlem başarısız.';
+      if (msg.startsWith('NOT_FOUND:')) return NextResponse.json({ error: msg.slice(10) }, { status: 404 });
+      if (msg.startsWith('BAD:')) return NextResponse.json({ error: msg.slice(4) }, { status: 400 });
+      return NextResponse.json({ error: msg }, { status: 500 });
+    }
+  }
+
+  const sale = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM credit_sales WHERE id = ? AND business_id = ? LIMIT 1',
+    [payload.id, ctx.business.id]
+  );
+
+  if (!sale || toBool(sale.is_cancelled)) {
     return NextResponse.json({ error: 'Aktif vadeli satış bulunamadı.' }, { status: 404 });
   }
 
-  if (payload.action === 'collect_payment') {
-    const remaining = roundCurrency(Number(sale.total_amount) - Number(sale.paid_amount));
-    const amt = roundCurrency(payload.amount);
-    if (amt > remaining) {
-      return NextResponse.json(
-        {
-          error: `Tahsilat tutarı bu vadeli satışın kalan bakiyesinden (${remaining.toFixed(2)} TL) fazla olamaz.`,
-        },
-        { status: 400 }
-      );
-    }
+  await withTransaction(async (conn) => {
+    await conn.execute(
+      'UPDATE credit_sales SET is_cancelled = 1, cancelled_at = ?, updated_at = ? WHERE id = ?',
+      [nowStr, nowStr, String(sale.id)]
+    );
+    await conn.execute(
+      'UPDATE customer_transactions SET is_cancelled = 1 WHERE credit_sale_id = ? AND business_id = ?',
+      [String(sale.id), ctx.business!.id]
+    );
+  });
 
-    const { error: txErr } = await db.from('customer_transactions').insert({
-      business_id: ctx.business.id,
-      customer_id: sale.customer_id,
-      credit_sale_id: sale.id,
-      transaction_type: 'payment',
-      debt_category: 'Vadeli Satış Tahsilatı',
-      amount: amt,
-      signed_amount: -amt,
-      transaction_date: payload.paymentDate,
-      payment_method: payload.paymentMethod,
-      description: payload.description || `${sale.description} tahsilatı`,
-      created_by: ctx.userId,
-    });
-
-    if (txErr) {
-      return NextResponse.json({ error: txErr.message }, { status: 500 });
-    }
-
-    const newPaid = roundCurrency(Number(sale.paid_amount) + amt);
-    await db
-      .from('credit_sales')
-      .update({ paid_amount: newPaid, updated_at: new Date().toISOString() })
-      .eq('id', sale.id);
-
-    return NextResponse.json({ success: true, paidAmount: newPaid });
-  }
-
-  // İptal
-  await db
-    .from('credit_sales')
-    .update({
-      is_cancelled: true,
-      cancelled_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', sale.id);
-
-  await db
-    .from('customer_transactions')
-    .update({ is_cancelled: true })
-    .eq('credit_sale_id', sale.id)
-    .eq('business_id', ctx.business.id);
-
-  await db.from('audit_logs').insert({
+  await writeAuditLog({
     scope: 'business',
-    business_id: ctx.business.id,
-    actor_user_id: ctx.userId,
+    businessId: ctx.business.id,
+    actorUserId: ctx.userId,
     action: 'credit_sale_cancelled',
-    entity_type: 'credit_sales',
-    entity_id: sale.id,
-    old_values: { total_amount: sale.total_amount },
-    description: `Vadeli satış iptal edildi: ${sale.description}`,
+    entityType: 'credit_sales',
+    entityId: String(sale.id),
+    oldValues: { total_amount: sale.total_amount },
+    description: `Vadeli satış iptal edildi: ${String(sale.description)}`,
   });
 
   return NextResponse.json({ success: true });

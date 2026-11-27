@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessContext } from '@/lib/auth-server';
+import {
+  execute,
+  query,
+  queryOne,
+  toBool,
+  toIsoString,
+  toMySqlDateTime,
+  uuid,
+  writeAuditLog,
+} from '@/lib/db';
 import { getIstanbulTodayISO, roundCurrency } from '@/lib/format';
 
 const customerSchema = z.object({
@@ -15,28 +25,23 @@ const customerSchema = z.object({
 });
 
 export async function GET() {
-  const { error, ctx, db } = await requireBusinessContext('customers.view');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('customers.view');
+  if (error || !ctx || !ctx.business) return error!;
 
-  const [{ data: customers, error: custErr }, { data: transactions }] = await Promise.all([
-    db
-      .from('customers')
-      .select('*')
-      .eq('business_id', ctx.business.id)
-      .order('created_at', { ascending: false }),
-    db
-      .from('customer_transactions')
-      .select('customer_id, transaction_type, amount, signed_amount, is_cancelled')
-      .eq('business_id', ctx.business.id)
-      .eq('is_cancelled', false),
+  const [customers, transactions] = await Promise.all([
+    query<Record<string, unknown>>(
+      'SELECT * FROM customers WHERE business_id = ? ORDER BY created_at DESC',
+      [ctx.business.id]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT customer_id, transaction_type, amount, signed_amount, is_cancelled FROM customer_transactions WHERE business_id = ? AND is_cancelled = 0',
+      [ctx.business.id]
+    ),
   ]);
 
-  if (custErr) {
-    return NextResponse.json({ error: custErr.message }, { status: 500 });
-  }
-
-  const enriched = (customers ?? []).map((c) => {
-    const txs = (transactions ?? []).filter((t) => t.customer_id === c.id);
+  const enriched = customers.map((c) => {
+    const cid = String(c.id);
+    const txs = transactions.filter((t) => String(t.customer_id) === cid);
     const opening = Number(c.opening_balance ?? 0);
     const debtSum = txs
       .filter((t) => t.transaction_type === 'debt')
@@ -47,6 +52,8 @@ export async function GET() {
     const netTx = txs.reduce((acc, t) => acc + Number(t.signed_amount), 0);
     return {
       ...c,
+      is_active: toBool(c.is_active),
+      created_at: toIsoString(c.created_at),
       opening_balance: roundCurrency(opening),
       total_debt: roundCurrency(opening + debtSum),
       total_payment: roundCurrency(paymentSum),
@@ -58,8 +65,8 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessContext('customers.create');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('customers.create');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -77,37 +84,53 @@ export async function POST(req: NextRequest) {
   }
 
   const d = parsed.data;
-  const { data: created, error: insertErr } = await db
-    .from('customers')
-    .insert({
-      business_id: ctx.business.id,
-      name: d.name,
-      last_name: d.lastName,
-      phone: d.phone,
-      email: d.email,
-      address: d.address,
-      notes: d.notes,
-      opening_balance: roundCurrency(d.openingBalance),
-      registered_at: d.registeredAt ?? getIstanbulTodayISO(),
-      is_active: true,
-    })
-    .select('*')
-    .single();
+  const id = uuid();
+  const nowStr = toMySqlDateTime();
+  const opening = roundCurrency(d.openingBalance);
+  const regDate = d.registeredAt ?? getIstanbulTodayISO();
 
-  if (insertErr) {
-    return NextResponse.json({ error: insertErr.message }, { status: 500 });
-  }
+  await execute(
+    `INSERT INTO customers
+     (id, business_id, name, last_name, phone, email, address, notes, opening_balance, registered_at, is_active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    [
+      id,
+      ctx.business.id,
+      d.name,
+      d.lastName,
+      d.phone,
+      d.email,
+      d.address,
+      d.notes,
+      opening,
+      regDate,
+      nowStr,
+      nowStr,
+    ]
+  );
 
-  await db.from('audit_logs').insert({
+  const created = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM customers WHERE id = ? LIMIT 1',
+    [id]
+  );
+
+  await writeAuditLog({
     scope: 'business',
-    business_id: ctx.business.id,
-    actor_user_id: ctx.userId,
+    businessId: ctx.business.id,
+    actorUserId: ctx.userId,
     action: 'customer_created',
-    entity_type: 'customers',
-    entity_id: created.id,
-    new_values: { name: created.name, opening_balance: created.opening_balance },
-    description: `${created.name} müşterisi oluşturuldu.`,
+    entityType: 'customers',
+    entityId: id,
+    newValues: { name: d.name, opening_balance: opening },
+    description: `${d.name} müşterisi oluşturuldu.`,
   });
 
-  return NextResponse.json({ customer: created }, { status: 201 });
+  return NextResponse.json(
+    {
+      customer: created
+        ? { ...created, is_active: toBool(created.is_active), opening_balance: opening }
+        : null,
+    },
+    { status: 201 }
+  );
 }

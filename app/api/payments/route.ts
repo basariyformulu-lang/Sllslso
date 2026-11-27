@@ -1,7 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { getAuthContext } from '@/lib/auth-server';
-import { createServiceRoleSupabase, isServiceRoleConfigured } from '@/lib/supabase/server';
+import {
+  execute,
+  isDatabaseConfigured,
+  parseJsonField,
+  query,
+  queryOne,
+  toBool,
+  toIsoString,
+  toMySqlDateTime,
+  uuid,
+  writeAuditLog,
+} from '@/lib/db';
 import { roundCurrency } from '@/lib/format';
 
 const submitPaymentSchema = z.object({
@@ -14,8 +25,8 @@ const submitPaymentSchema = z.object({
 });
 
 export async function GET() {
-  if (!isServiceRoleConfigured()) {
-    return NextResponse.json({ error: 'Supabase yapılandırılmamış.' }, { status: 503 });
+  if (!isDatabaseConfigured()) {
+    return NextResponse.json({ error: 'MySQL veritabanı yapılandırılmamış.' }, { status: 503 });
   }
 
   const ctx = await getAuthContext();
@@ -23,37 +34,52 @@ export async function GET() {
     return NextResponse.json({ error: 'Oturum açmanız gerekiyor.' }, { status: 401 });
   }
 
-  const db = createServiceRoleSupabase()!;
-  const [{ data: plan }, { data: subscription }, { data: bankAccounts }, { data: requests }] =
-    await Promise.all([
-      db.from('subscription_plans').select('*').limit(1).maybeSingle(),
-      db.from('subscriptions').select('*').eq('business_id', ctx.business.id).maybeSingle(),
-      db
-        .from('bank_accounts')
-        .select('*')
-        .eq('is_active', true)
-        .order('is_default', { ascending: false })
-        .order('created_at', { ascending: true }),
-      db
-        .from('payment_requests')
-        .select('*')
-        .eq('business_id', ctx.business.id)
-        .order('created_at', { ascending: false }),
-    ]);
+  const [planRow, subscription, bankRows, requestRows] = await Promise.all([
+    queryOne<Record<string, unknown>>('SELECT * FROM subscription_plans LIMIT 1'),
+    queryOne<Record<string, unknown>>(
+      'SELECT * FROM subscriptions WHERE business_id = ? ORDER BY created_at DESC LIMIT 1',
+      [ctx.business.id]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM bank_accounts WHERE is_active = 1 ORDER BY is_default DESC, created_at ASC'
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM payment_requests WHERE business_id = ? ORDER BY created_at DESC',
+      [ctx.business.id]
+    ),
+  ]);
 
   return NextResponse.json({
     business: ctx.business,
     isSubscriptionActive: ctx.isSubscriptionActive,
-    plan,
+    plan: planRow
+      ? {
+          ...planRow,
+          monthly_price: Number(planRow.monthly_price ?? 0),
+          features: parseJsonField<string[]>(planRow.features, []),
+          is_active: toBool(planRow.is_active),
+        }
+      : null,
     subscription,
-    bankAccounts: bankAccounts ?? [],
-    requests: requests ?? [],
+    bankAccounts: bankRows.map((b) => ({
+      ...b,
+      is_active: toBool(b.is_active),
+      is_default: toBool(b.is_default),
+      created_at: toIsoString(b.created_at),
+    })),
+    requests: requestRows.map((r) => ({
+      ...r,
+      amount: Number(r.amount ?? 0),
+      bank_snapshot: parseJsonField(r.bank_snapshot, {}),
+      created_at: toIsoString(r.created_at),
+      reviewed_at: toIsoString(r.reviewed_at),
+    })),
   });
 }
 
 export async function POST(req: NextRequest) {
-  if (!isServiceRoleConfigured()) {
-    return NextResponse.json({ error: 'Supabase yapılandırılmamış.' }, { status: 503 });
+  if (!isDatabaseConfigured()) {
+    return NextResponse.json({ error: 'MySQL veritabanı yapılandırılmamış.' }, { status: 503 });
   }
 
   const ctx = await getAuthContext();
@@ -76,13 +102,10 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const db = createServiceRoleSupabase()!;
-  const { data: pendingExisting } = await db
-    .from('payment_requests')
-    .select('id')
-    .eq('business_id', ctx.business.id)
-    .eq('status', 'pending')
-    .maybeSingle();
+  const pendingExisting = await queryOne<{ id: string }>(
+    'SELECT id FROM payment_requests WHERE business_id = ? AND status = ? LIMIT 1',
+    [ctx.business.id, 'pending']
+  );
 
   if (pendingExisting) {
     return NextResponse.json(
@@ -94,12 +117,10 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { data: bankAccount } = await db
-    .from('bank_accounts')
-    .select('*')
-    .eq('id', parsed.data.bankAccountId)
-    .eq('is_active', true)
-    .maybeSingle();
+  const bankAccount = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM bank_accounts WHERE id = ? AND is_active = 1 LIMIT 1',
+    [parsed.data.bankAccountId]
+  );
 
   if (!bankAccount) {
     return NextResponse.json(
@@ -108,72 +129,76 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { data: plan } = await db.from('subscription_plans').select('*').limit(1).maybeSingle();
-  const { data: subscription } = await db
-    .from('subscriptions')
-    .select('*')
-    .eq('business_id', ctx.business.id)
-    .maybeSingle();
+  const [plan, subscription] = await Promise.all([
+    queryOne<{ id: string }>('SELECT id FROM subscription_plans LIMIT 1'),
+    queryOne<{ id: string }>(
+      'SELECT id FROM subscriptions WHERE business_id = ? ORDER BY created_at DESC LIMIT 1',
+      [ctx.business.id]
+    ),
+  ]);
 
   if (!plan) {
     return NextResponse.json({ error: 'Abonelik paketi bulunamadı.' }, { status: 500 });
   }
 
-  // Banka bilgilerini talep anında snapshot olarak sakla
   const bankSnapshot = {
-    bank_name: bankAccount.bank_name,
-    iban: bankAccount.iban,
-    account_holder: bankAccount.account_holder,
-    description: bankAccount.description,
+    bank_name: String(bankAccount.bank_name ?? ''),
+    iban: String(bankAccount.iban ?? ''),
+    account_holder: String(bankAccount.account_holder ?? ''),
+    description: String(bankAccount.description ?? ''),
   };
 
-  const { data: created, error: insertErr } = await db
-    .from('payment_requests')
-    .insert({
-      business_id: ctx.business.id,
-      subscription_id: subscription?.id ?? null,
-      plan_id: plan.id,
-      bank_account_id: bankAccount.id,
-      bank_snapshot: bankSnapshot,
-      payer_name: parsed.data.payerName,
-      amount: roundCurrency(parsed.data.amount),
-      payment_date: parsed.data.paymentDate,
-      receipt_url: parsed.data.receiptUrl ?? null,
-      receipt_name: parsed.data.receiptName ?? null,
-      status: 'pending',
-    })
-    .select('*')
-    .single();
+  const reqId = uuid();
+  const amount = roundCurrency(parsed.data.amount);
+  const nowStr = toMySqlDateTime();
 
-  if (insertErr) {
-    return NextResponse.json(
-      { error: 'Ödeme talebi kaydedilemedi. Zaten bekleyen bir talebiniz olabilir.' },
-      { status: 409 }
-    );
-  }
+  await execute(
+    `INSERT INTO payment_requests
+     (id, business_id, subscription_id, plan_id, bank_account_id, bank_snapshot, payer_name, amount, payment_date, receipt_url, receipt_name, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+    [
+      reqId,
+      ctx.business.id,
+      subscription?.id ?? null,
+      plan.id,
+      String(bankAccount.id),
+      JSON.stringify(bankSnapshot),
+      parsed.data.payerName,
+      amount,
+      parsed.data.paymentDate,
+      parsed.data.receiptUrl ?? null,
+      parsed.data.receiptName ?? null,
+      nowStr,
+    ]
+  );
 
-  await db
-    .from('businesses')
-    .update({ subscription_status: 'pending_approval', updated_at: new Date().toISOString() })
-    .eq('id', ctx.business.id);
+  await execute(
+    'UPDATE businesses SET subscription_status = ?, updated_at = ? WHERE id = ?',
+    ['pending_approval', nowStr, ctx.business.id]
+  );
 
   if (subscription) {
-    await db
-      .from('subscriptions')
-      .update({ status: 'pending_approval', updated_at: new Date().toISOString() })
-      .eq('id', subscription.id);
+    await execute('UPDATE subscriptions SET status = ? WHERE id = ?', [
+      'pending_approval',
+      subscription.id,
+    ]);
   }
 
-  await db.from('audit_logs').insert({
+  await writeAuditLog({
     scope: 'business',
-    business_id: ctx.business.id,
-    actor_user_id: ctx.userId,
+    businessId: ctx.business.id,
+    actorUserId: ctx.userId,
     action: 'payment_request_submitted',
-    entity_type: 'payment_requests',
-    entity_id: created.id,
-    new_values: { amount: created.amount, payer_name: created.payer_name },
+    entityType: 'payment_requests',
+    entityId: reqId,
+    newValues: { amount, payer_name: parsed.data.payerName },
     description: 'Havale/EFT ödeme bildirimi gönderildi.',
   });
+
+  const created = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM payment_requests WHERE id = ? LIMIT 1',
+    [reqId]
+  );
 
   return NextResponse.json({ success: true, request: created }, { status: 201 });
 }

@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessContext } from '@/lib/auth-server';
+import {
+  execute,
+  query,
+  queryOne,
+  toBool,
+  toIsoString,
+  toMySqlDateTime,
+  uuid,
+  writeAuditLog,
+} from '@/lib/db';
 import { getIstanbulTodayISO, roundCurrency } from '@/lib/format';
 
 const supplierSchema = z.object({
@@ -14,29 +24,24 @@ const supplierSchema = z.object({
 });
 
 export async function GET() {
-  const { error, ctx, db } = await requireBusinessContext('suppliers.view');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('suppliers.view');
+  if (error || !ctx || !ctx.business) return error!;
 
   const today = getIstanbulTodayISO();
-  const [{ data: suppliers, error: suppErr }, { data: transactions }] = await Promise.all([
-    db
-      .from('suppliers')
-      .select('*')
-      .eq('business_id', ctx.business.id)
-      .order('created_at', { ascending: false }),
-    db
-      .from('supplier_transactions')
-      .select('supplier_id, transaction_type, amount, signed_amount, due_date, is_cancelled')
-      .eq('business_id', ctx.business.id)
-      .eq('is_cancelled', false),
+  const [suppliers, transactions] = await Promise.all([
+    query<Record<string, unknown>>(
+      'SELECT * FROM suppliers WHERE business_id = ? ORDER BY created_at DESC',
+      [ctx.business.id]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT supplier_id, transaction_type, amount, signed_amount, due_date, is_cancelled FROM supplier_transactions WHERE business_id = ? AND is_cancelled = 0',
+      [ctx.business.id]
+    ),
   ]);
 
-  if (suppErr) {
-    return NextResponse.json({ error: suppErr.message }, { status: 500 });
-  }
-
-  const enriched = (suppliers ?? []).map((s) => {
-    const txs = (transactions ?? []).filter((t) => t.supplier_id === s.id);
+  const enriched = suppliers.map((s) => {
+    const sid = String(s.id);
+    const txs = transactions.filter((t) => String(t.supplier_id) === sid);
     const opening = Number(s.opening_balance ?? 0);
     const debtSum = txs
       .filter((t) => t.transaction_type === 'debt')
@@ -48,7 +53,10 @@ export async function GET() {
       opening + txs.reduce((acc, t) => acc + Number(t.signed_amount), 0)
     );
     const dueDebts = txs
-      .filter((t) => t.transaction_type === 'debt' && t.due_date && t.due_date <= today)
+      .filter(
+        (t) =>
+          t.transaction_type === 'debt' && t.due_date && String(t.due_date) <= today
+      )
       .reduce((acc, t) => acc + Number(t.amount), 0);
     const overdueDebt = roundCurrency(
       Math.min(Math.max(0, currentBalance), Math.max(0, dueDebts - Math.max(0, paymentSum - opening)))
@@ -56,6 +64,8 @@ export async function GET() {
 
     return {
       ...s,
+      is_active: toBool(s.is_active),
+      created_at: toIsoString(s.created_at),
       opening_balance: roundCurrency(opening),
       total_debt: roundCurrency(opening + debtSum),
       total_payment: roundCurrency(paymentSum),
@@ -68,8 +78,8 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessContext('suppliers.create');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessContext('suppliers.create');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -87,36 +97,51 @@ export async function POST(req: NextRequest) {
   }
 
   const d = parsed.data;
-  const { data: created, error: insertErr } = await db
-    .from('suppliers')
-    .insert({
-      business_id: ctx.business.id,
-      company_name: d.companyName,
-      contact_name: d.contactName,
-      phone: d.phone,
-      email: d.email,
-      address: d.address,
-      notes: d.notes,
-      opening_balance: roundCurrency(d.openingBalance),
-      is_active: true,
-    })
-    .select('*')
-    .single();
+  const id = uuid();
+  const nowStr = toMySqlDateTime();
+  const opening = roundCurrency(d.openingBalance);
 
-  if (insertErr) {
-    return NextResponse.json({ error: insertErr.message }, { status: 500 });
-  }
+  await execute(
+    `INSERT INTO suppliers
+     (id, business_id, company_name, contact_name, phone, email, address, notes, opening_balance, is_active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    [
+      id,
+      ctx.business.id,
+      d.companyName,
+      d.contactName,
+      d.phone,
+      d.email,
+      d.address,
+      d.notes,
+      opening,
+      nowStr,
+      nowStr,
+    ]
+  );
 
-  await db.from('audit_logs').insert({
+  const created = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM suppliers WHERE id = ? LIMIT 1',
+    [id]
+  );
+
+  await writeAuditLog({
     scope: 'business',
-    business_id: ctx.business.id,
-    actor_user_id: ctx.userId,
+    businessId: ctx.business.id,
+    actorUserId: ctx.userId,
     action: 'supplier_created',
-    entity_type: 'suppliers',
-    entity_id: created.id,
-    new_values: { company_name: created.company_name, opening_balance: created.opening_balance },
-    description: `${created.company_name} toptancısı oluşturuldu.`,
+    entityType: 'suppliers',
+    entityId: id,
+    newValues: { company_name: d.companyName, opening_balance: opening },
+    description: `${d.companyName} toptancısı oluşturuldu.`,
   });
 
-  return NextResponse.json({ supplier: created }, { status: 201 });
+  return NextResponse.json(
+    {
+      supplier: created
+        ? { ...created, is_active: toBool(created.is_active), opening_balance: opening }
+        : null,
+    },
+    { status: 201 }
+  );
 }

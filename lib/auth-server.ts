@@ -1,12 +1,8 @@
 import { NextResponse } from 'next/server';
-import {
-  createServerSupabase,
-  createServiceRoleSupabase,
-  isServiceRoleConfigured,
-  isSupabaseConfigured,
-} from '@/lib/supabase/server';
+import { getSessionFromCookies } from '@/lib/auth-mysql';
+import { execute, isDatabaseConfigured, parseJsonField, queryOne, toBool, toIsoString, toMySqlDateTime } from '@/lib/db';
 import { hasPermission } from '@/lib/permissions';
-import type { Business, BusinessMember, CustomerAccount } from '@/lib/types';
+import type { Business, BusinessMember } from '@/lib/types';
 
 export interface AuthContext {
   userId: string;
@@ -16,71 +12,87 @@ export interface AuthContext {
   member: BusinessMember | null;
   business: Business | null;
   isSubscriptionActive: boolean;
-  customerAccount: CustomerAccount | null;
 }
 
 export async function getAuthContext(): Promise<AuthContext | null> {
-  if (!isSupabaseConfigured() || !isServiceRoleConfigured()) {
+  if (!isDatabaseConfigured()) {
     return null;
   }
 
-  const supabase = await createServerSupabase();
-  const adminDb = createServiceRoleSupabase();
-  if (!supabase || !adminDb) return null;
+  const session = await getSessionFromCookies();
+  if (!session) return null;
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) return null;
-
-  const [{ data: adminRow }, { data: memberRow }, { data: custRow }] = await Promise.all([
-    adminDb
-      .from('system_admins')
-      .select('*')
-      .eq('user_id', user.id)
-      .eq('is_active', true)
-      .maybeSingle(),
-    adminDb
-      .from('business_members')
-      .select('*, profile:profiles(id, first_name, last_name, phone, email)')
-      .eq('user_id', user.id)
-      .eq('is_active', true)
-      .maybeSingle(),
-    adminDb
-      .from('customer_accounts')
-      .select('*')
-      .eq('user_id', user.id)
-      .maybeSingle(),
+  const adminRow = await queryOne<{
+    user_id: string;
+    full_name: string;
+    email: string;
+  }>('SELECT user_id, full_name, email FROM system_admins WHERE user_id = ? LIMIT 1', [
+    session.userId,
   ]);
+
+  const memberRow = await queryOne<{
+    id: string;
+    business_id: string;
+    user_id: string;
+    role_name: string;
+    is_owner: number;
+    is_active: number;
+    permissions: string;
+    p_first_name: string | null;
+    p_last_name: string | null;
+    p_phone: string | null;
+    p_email: string | null;
+  }>(
+    `SELECT bm.id, bm.business_id, bm.user_id, bm.role_name, bm.is_owner, bm.is_active, bm.permissions,
+            p.first_name AS p_first_name, p.last_name AS p_last_name, p.phone AS p_phone, p.email AS p_email
+     FROM business_members bm
+     LEFT JOIN profiles p ON p.id = bm.user_id
+     WHERE bm.user_id = ? AND bm.is_active = 1
+     LIMIT 1`,
+    [session.userId]
+  );
 
   let business: Business | null = null;
   let isSubscriptionActive = false;
 
   if (memberRow) {
-    const { data: bizRow } = await adminDb
-      .from('businesses')
-      .select('*')
-      .eq('id', memberRow.business_id)
-      .maybeSingle();
+    const bizRow = await queryOne<Record<string, unknown>>(
+      'SELECT * FROM businesses WHERE id = ? LIMIT 1',
+      [memberRow.business_id]
+    );
 
     if (bizRow) {
-      business = bizRow as Business;
+      business = {
+        id: String(bizRow.id),
+        name: String(bizRow.name),
+        business_code: String(bizRow.business_code),
+        owner_id: String(bizRow.owner_id),
+        phone: String(bizRow.phone ?? ''),
+        email: String(bizRow.email ?? ''),
+        address: String(bizRow.address ?? ''),
+        subscription_status: bizRow.subscription_status as Business['subscription_status'],
+        subscription_start_at: toIsoString(bizRow.subscription_start_at),
+        subscription_end_at: toIsoString(bizRow.subscription_end_at),
+        is_active: toBool(bizRow.is_active),
+        booking_module_enabled: toBool(bizRow.booking_module_enabled),
+        booking_module_mode: (bizRow.booking_module_mode as Business['booking_module_mode']) ?? 'included',
+        created_at: toIsoString(bizRow.created_at) ?? new Date().toISOString(),
+      };
 
-      // Süresi dolmuş aboneliği otomatik güncelle
       if (
         business.subscription_status === 'active' &&
         business.subscription_end_at &&
         new Date(business.subscription_end_at).getTime() <= Date.now()
       ) {
-        await adminDb
-          .from('businesses')
-          .update({ subscription_status: 'expired', updated_at: new Date().toISOString() })
-          .eq('id', business.id);
-        await adminDb
-          .from('subscriptions')
-          .update({ status: 'expired', updated_at: new Date().toISOString() })
-          .eq('business_id', business.id);
+        const nowStr = toMySqlDateTime();
+        await execute(
+          'UPDATE businesses SET subscription_status = ?, updated_at = ? WHERE id = ?',
+          ['expired', nowStr, business.id]
+        );
+        await execute(
+          'UPDATE subscriptions SET status = ? WHERE business_id = ?',
+          ['expired', business.id]
+        );
         business.subscription_status = 'expired';
       }
 
@@ -92,32 +104,46 @@ export async function getAuthContext(): Promise<AuthContext | null> {
     }
   }
 
+  if (!adminRow && !memberRow) {
+    return null;
+  }
+
   return {
-    userId: user.id,
-    email: user.email ?? '',
+    userId: session.userId,
+    email: adminRow?.email ?? memberRow?.p_email ?? session.email ?? '',
     isSystemAdmin: Boolean(adminRow),
     adminName: adminRow?.full_name ?? null,
     member: memberRow
-      ? ({
-          ...memberRow,
-          permissions: Array.isArray(memberRow.permissions) ? memberRow.permissions : [],
-        } as BusinessMember)
+      ? {
+          id: memberRow.id,
+          business_id: memberRow.business_id,
+          user_id: memberRow.user_id,
+          role_name: memberRow.role_name,
+          is_owner: toBool(memberRow.is_owner),
+          is_active: toBool(memberRow.is_active),
+          permissions: parseJsonField<string[]>(memberRow.permissions, []),
+          profile: {
+            id: memberRow.user_id,
+            first_name: memberRow.p_first_name ?? '',
+            last_name: memberRow.p_last_name ?? '',
+            phone: memberRow.p_phone ?? '',
+            email: memberRow.p_email ?? '',
+          },
+        }
       : null,
     business,
     isSubscriptionActive,
-    customerAccount: (custRow as CustomerAccount) ?? null,
   };
 }
 
 export async function requireBusinessContext(permissionCode?: string) {
-  if (!isSupabaseConfigured() || !isServiceRoleConfigured()) {
+  if (!isDatabaseConfigured()) {
     return {
       error: NextResponse.json(
-        { error: 'Supabase veritabanı yapılandırılmamış.' },
+        { error: 'MySQL veritabanı yapılandırılmamış.' },
         { status: 503 }
       ),
       ctx: null,
-      db: null,
     };
   }
 
@@ -126,7 +152,6 @@ export async function requireBusinessContext(permissionCode?: string) {
     return {
       error: NextResponse.json({ error: 'Oturum açmanız gerekiyor.' }, { status: 401 }),
       ctx: null,
-      db: null,
     };
   }
 
@@ -134,7 +159,6 @@ export async function requireBusinessContext(permissionCode?: string) {
     return {
       error: NextResponse.json({ error: 'İşletme üyeliği bulunamadı.' }, { status: 403 }),
       ctx: null,
-      db: null,
     };
   }
 
@@ -145,7 +169,6 @@ export async function requireBusinessContext(permissionCode?: string) {
         { status: 402 }
       ),
       ctx: null,
-      db: null,
     };
   }
 
@@ -156,26 +179,23 @@ export async function requireBusinessContext(permissionCode?: string) {
         { status: 403 }
       ),
       ctx: null,
-      db: null,
     };
   }
 
-  const db = createServiceRoleSupabase()!;
-  return { error: null, ctx, db };
+  return { error: null, ctx };
 }
 
 export async function requireBusinessBookingContext(
   permissionCode?: string,
   allowReadOnly = false
 ) {
-  if (!isSupabaseConfigured() || !isServiceRoleConfigured()) {
+  if (!isDatabaseConfigured()) {
     return {
       error: NextResponse.json(
-        { error: 'Supabase veritabanı yapılandırılmamış.' },
+        { error: 'MySQL veritabanı yapılandırılmamış.' },
         { status: 503 }
       ),
       ctx: null,
-      db: null,
       readOnly: false,
     };
   }
@@ -185,7 +205,6 @@ export async function requireBusinessBookingContext(
     return {
       error: NextResponse.json({ error: 'Oturum açmanız gerekiyor.' }, { status: 401 }),
       ctx: null,
-      db: null,
       readOnly: false,
     };
   }
@@ -194,7 +213,6 @@ export async function requireBusinessBookingContext(
     return {
       error: NextResponse.json({ error: 'İşletme üyeliği bulunamadı.' }, { status: 403 }),
       ctx: null,
-      db: null,
       readOnly: false,
     };
   }
@@ -206,7 +224,6 @@ export async function requireBusinessBookingContext(
         { status: 403 }
       ),
       ctx: null,
-      db: null,
       readOnly: false,
     };
   }
@@ -227,75 +244,21 @@ export async function requireBusinessBookingContext(
         { status: !ctx.isSubscriptionActive ? 402 : 403 }
       ),
       ctx: null,
-      db: null,
       readOnly: true,
     };
   }
 
-  const db = createServiceRoleSupabase()!;
-  return { error: null, ctx, db, readOnly };
-}
-
-export async function requireCustomerContext() {
-  if (!isSupabaseConfigured() || !isServiceRoleConfigured()) {
-    return {
-      error: NextResponse.json(
-        { error: 'Supabase veritabanı yapılandırılmamış.' },
-        { status: 503 }
-      ),
-      ctx: null,
-      db: null,
-    };
-  }
-
-  const ctx = await getAuthContext();
-  if (!ctx) {
-    return {
-      error: NextResponse.json({ error: 'Randevu işlemleri için giriş yapmalısınız.' }, { status: 401 }),
-      ctx: null,
-      db: null,
-    };
-  }
-
-  const db = createServiceRoleSupabase()!;
-
-  // Eğer kullanıcı Supabase Auth ile kayıtlı ama henüz customer_accounts kaydı yoksa profilden senkronize et
-  if (!ctx.customerAccount) {
-    const { data: profile } = await db
-      .from('profiles')
-      .select('*')
-      .eq('id', ctx.userId)
-      .maybeSingle();
-
-    const { data: created } = await db
-      .from('customer_accounts')
-      .upsert({
-        user_id: ctx.userId,
-        first_name: profile?.first_name || 'Müşteri',
-        last_name: profile?.last_name || '',
-        phone: profile?.phone || '',
-        email: profile?.email || ctx.email,
-      })
-      .select('*')
-      .single();
-
-    if (created) {
-      ctx.customerAccount = created as CustomerAccount;
-    }
-  }
-
-  return { error: null, ctx, db };
+  return { error: null, ctx, readOnly };
 }
 
 export async function requireSystemAdmin() {
-  if (!isSupabaseConfigured() || !isServiceRoleConfigured()) {
+  if (!isDatabaseConfigured()) {
     return {
       error: NextResponse.json(
-        { error: 'Supabase veritabanı yapılandırılmamış.' },
+        { error: 'MySQL veritabanı yapılandırılmamış.' },
         { status: 503 }
       ),
       ctx: null,
-      db: null,
     };
   }
 
@@ -304,7 +267,6 @@ export async function requireSystemAdmin() {
     return {
       error: NextResponse.json({ error: 'Oturum açmanız gerekiyor.' }, { status: 401 }),
       ctx: null,
-      db: null,
     };
   }
 
@@ -315,10 +277,8 @@ export async function requireSystemAdmin() {
         { status: 403 }
       ),
       ctx: null,
-      db: null,
     };
   }
 
-  const db = createServiceRoleSupabase()!;
-  return { error: null, ctx, db };
+  return { error: null, ctx };
 }

@@ -16,7 +16,7 @@ export default function BookingHoursPage() {
   const [saving, setSaving] = useState(false);
 
   const [hours, setHours] = useState<BookingBusinessHour[]>(DEFAULT_BUSINESS_HOURS);
-  const [slotInterval, setSlotInterval] = useState(15);
+  const [slotInterval, setSlotInterval] = useState(30);
   const [globalLeaves, setGlobalLeaves] = useState<StaffLeave[]>([]);
 
   const [holidayForm, setHolidayForm] = useState({
@@ -37,7 +37,7 @@ export default function BookingHoursPage() {
 
       if (pageRes.ok && pageJson.page) {
         setHours(pageJson.page.business_hours ?? DEFAULT_BUSINESS_HOURS);
-        setSlotInterval(pageJson.page.slot_interval_minutes ?? 15);
+        setSlotInterval(Math.max(30, pageJson.page.slot_interval_minutes ?? 30));
         setReadOnly(Boolean(pageJson.readOnly));
       }
       if (staffRes.ok) {
@@ -158,9 +158,9 @@ export default function BookingHoursPage() {
                     onChange={(e) => setSlotInterval(Number(e.target.value))}
                     className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium"
                   >
-                    {[10, 15, 20, 30, 45, 60].map((v) => (
+                    {[30, 45, 60].map((v) => (
                       <option key={v} value={v}>
-                        {v} dakika
+                        {v === 30 ? '30 dakika (Önerilen)' : `${v} dakika`}
                       </option>
                     ))}
                   </select>

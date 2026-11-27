@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessBookingContext } from '@/lib/auth-server';
-import { roundCurrency } from '@/lib/format';
 import { sanitizeExternalUrl } from '@/lib/booking-helpers';
+import { execute, query, queryOne, toBool, toIsoString, toMySqlDateTime, uuid } from '@/lib/db';
+import { roundCurrency } from '@/lib/format';
 
 const serviceSchema = z.object({
   name: z.string().trim().min(2, 'Hizmet adı giriniz.').max(140),
@@ -40,44 +41,44 @@ const patchServiceSchema = z.discriminatedUnion('action', [
 ]);
 
 export async function GET() {
-  const { error, ctx, db, readOnly } = await requireBusinessBookingContext('booking.view', true);
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx, readOnly } = await requireBusinessBookingContext('booking.view', true);
+  if (error || !ctx || !ctx.business) return error!;
 
   const businessId = ctx.business.id;
-  const [{ data: services }, { data: staff }, { data: staffServices }] = await Promise.all([
-    db
-      .from('booking_services')
-      .select('*')
-      .eq('business_id', businessId)
-      .order('sort_order', { ascending: true })
-      .order('created_at', { ascending: true }),
-    db
-      .from('booking_staff')
-      .select('id, full_name, is_active, avatar_url')
-      .eq('business_id', businessId)
-      .order('sort_order', { ascending: true }),
-    db.from('staff_services').select('staff_id, service_id').eq('business_id', businessId),
+  const [services, staff, staffServices] = await Promise.all([
+    query<Record<string, unknown>>(
+      'SELECT * FROM booking_services WHERE business_id = ? ORDER BY sort_order ASC, created_at ASC',
+      [businessId]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT id, full_name, is_active, avatar_url FROM booking_staff WHERE business_id = ? ORDER BY sort_order ASC',
+      [businessId]
+    ),
+    query<{ staff_id: string; service_id: string }>(
+      'SELECT staff_id, service_id FROM staff_services WHERE business_id = ?',
+      [businessId]
+    ),
   ]);
 
-  const enriched = (services ?? []).map((s) => ({
+  const enriched = services.map((s) => ({
     ...s,
     price: Number(s.price),
     discount_price: s.discount_price !== null ? Number(s.discount_price) : null,
-    staff_ids: (staffServices ?? [])
-      .filter((ss) => ss.service_id === s.id)
-      .map((ss) => ss.staff_id),
+    is_active: toBool(s.is_active),
+    created_at: toIsoString(s.created_at),
+    staff_ids: staffServices.filter((ss) => ss.service_id === s.id).map((ss) => ss.staff_id),
   }));
 
   return NextResponse.json({
     readOnly,
     services: enriched,
-    staff: staff ?? [],
+    staff: staff.map((st) => ({ ...st, is_active: toBool(st.is_active) })),
   });
 }
 
 export async function POST(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.services');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.services');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -108,55 +109,72 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { count } = await db
-    .from('booking_services')
-    .select('id', { count: 'exact', head: true })
-    .eq('business_id', ctx.business.id);
+  const cntRow = await queryOne<{ cnt: number }>(
+    'SELECT COUNT(*) AS cnt FROM booking_services WHERE business_id = ?',
+    [ctx.business.id]
+  );
 
-  const { data: created, error: createErr } = await db
-    .from('booking_services')
-    .insert({
-      business_id: ctx.business.id,
-      name: d.name,
-      description: d.description,
-      image_url: sanitizeExternalUrl(d.imageUrl) ?? '',
+  const id = uuid();
+  const nowStr = toMySqlDateTime();
+  await execute(
+    `INSERT INTO booking_services
+     (id, business_id, name, description, image_url, price, discount_price, duration_minutes, sort_order, is_active, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      ctx.business.id,
+      d.name,
+      d.description,
+      sanitizeExternalUrl(d.imageUrl) ?? '',
       price,
-      discount_price: discountPrice,
-      duration_minutes: d.durationMinutes,
-      sort_order: count ?? 0,
-      is_active: d.isActive,
-    })
-    .select('*')
-    .single();
-
-  if (createErr || !created) {
-    return NextResponse.json({ error: createErr?.message ?? 'Hizmet eklenemedi.' }, { status: 500 });
-  }
+      discountPrice,
+      d.durationMinutes,
+      Number(cntRow?.cnt ?? 0),
+      d.isActive ? 1 : 0,
+      nowStr,
+      nowStr,
+    ]
+  );
 
   if (d.staffIds.length > 0) {
-    const { data: validStaff } = await db
-      .from('booking_staff')
-      .select('id')
-      .eq('business_id', ctx.business.id)
-      .in('id', d.staffIds);
-    const validIds = (validStaff ?? []).map((s) => s.id);
-    if (validIds.length > 0) {
-      await db.from('staff_services').insert(
-        validIds.map((staffId) => ({
-          business_id: ctx.business!.id,
-          staff_id: staffId,
-          service_id: created.id,
-        }))
-      );
+    const allStaff = await query<{ id: string }>(
+      'SELECT id FROM booking_staff WHERE business_id = ?',
+      [ctx.business.id]
+    );
+    const allowed = new Set(allStaff.map((s) => s.id));
+    for (const staffId of d.staffIds) {
+      if (allowed.has(staffId)) {
+        await execute(
+          'INSERT IGNORE INTO staff_services (business_id, staff_id, service_id) VALUES (?, ?, ?)',
+          [ctx.business.id, staffId, id]
+        );
+      }
     }
   }
 
-  return NextResponse.json({ service: created }, { status: 201 });
+  const created = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM booking_services WHERE id = ? LIMIT 1',
+    [id]
+  );
+
+  return NextResponse.json(
+    {
+      service: created
+        ? {
+            ...created,
+            price: Number(created.price),
+            discount_price: created.discount_price !== null ? Number(created.discount_price) : null,
+            is_active: toBool(created.is_active),
+          }
+        : null,
+    },
+    { status: 201 }
+  );
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.services');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.services');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -174,27 +192,25 @@ export async function PATCH(req: NextRequest) {
   }
 
   const d = parsed.data;
+  const nowStr = toMySqlDateTime();
 
   if (d.action === 'reorder') {
     await Promise.all(
       d.orderedIds.map((id, idx) =>
-        db
-          .from('booking_services')
-          .update({ sort_order: idx, updated_at: new Date().toISOString() })
-          .eq('id', id)
-          .eq('business_id', ctx.business!.id)
+        execute(
+          'UPDATE booking_services SET sort_order = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+          [idx, nowStr, id, ctx.business!.id]
+        )
       )
     );
     return NextResponse.json({ success: true });
   }
 
   if (d.action === 'toggle_active') {
-    const { error: err } = await db
-      .from('booking_services')
-      .update({ is_active: d.isActive, updated_at: new Date().toISOString() })
-      .eq('id', d.id)
-      .eq('business_id', ctx.business.id);
-    if (err) return NextResponse.json({ error: err.message }, { status: 500 });
+    await execute(
+      'UPDATE booking_services SET is_active = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+      [d.isActive ? 1 : 0, nowStr, d.id, ctx.business.id]
+    );
     return NextResponse.json({ success: true });
   }
 
@@ -211,70 +227,77 @@ export async function PATCH(req: NextRequest) {
     );
   }
 
-  const { data: updated, error: updErr } = await db
-    .from('booking_services')
-    .update({
-      name: d.name,
-      description: d.description,
-      image_url: sanitizeExternalUrl(d.imageUrl) ?? '',
+  const res = await execute(
+    `UPDATE booking_services
+     SET name = ?, description = ?, image_url = ?, price = ?, discount_price = ?, duration_minutes = ?, is_active = ?, updated_at = ?
+     WHERE id = ? AND business_id = ?`,
+    [
+      d.name,
+      d.description,
+      sanitizeExternalUrl(d.imageUrl) ?? '',
       price,
-      discount_price: discountPrice,
-      duration_minutes: d.durationMinutes,
-      is_active: d.isActive,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', d.id)
-    .eq('business_id', ctx.business.id)
-    .select('*')
-    .maybeSingle();
+      discountPrice,
+      d.durationMinutes,
+      d.isActive ? 1 : 0,
+      nowStr,
+      d.id,
+      ctx.business.id,
+    ]
+  );
 
-  if (updErr || !updated) {
+  if (res.affectedRows === 0) {
     return NextResponse.json({ error: 'Hizmet güncellenemedi.' }, { status: 400 });
   }
 
   if (d.staffIds !== undefined) {
-    await db
-      .from('staff_services')
-      .delete()
-      .eq('business_id', ctx.business.id)
-      .eq('service_id', d.id);
-
+    await execute('DELETE FROM staff_services WHERE business_id = ? AND service_id = ?', [
+      ctx.business.id,
+      d.id,
+    ]);
     if (d.staffIds.length > 0) {
-      const { data: validStaff } = await db
-        .from('booking_staff')
-        .select('id')
-        .eq('business_id', ctx.business.id)
-        .in('id', d.staffIds);
-      const validIds = (validStaff ?? []).map((s) => s.id);
-      if (validIds.length > 0) {
-        await db.from('staff_services').insert(
-          validIds.map((staffId) => ({
-            business_id: ctx.business!.id,
-            staff_id: staffId,
-            service_id: d.id,
-          }))
-        );
+      const allStaff = await query<{ id: string }>(
+        'SELECT id FROM booking_staff WHERE business_id = ?',
+        [ctx.business.id]
+      );
+      const allowed = new Set(allStaff.map((s) => s.id));
+      for (const staffId of d.staffIds) {
+        if (allowed.has(staffId)) {
+          await execute(
+            'INSERT IGNORE INTO staff_services (business_id, staff_id, service_id) VALUES (?, ?, ?)',
+            [ctx.business.id, staffId, d.id]
+          );
+        }
       }
     }
   }
 
-  return NextResponse.json({ service: updated });
+  const updated = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM booking_services WHERE id = ? LIMIT 1',
+    [d.id]
+  );
+  return NextResponse.json({
+    service: updated
+      ? {
+          ...updated,
+          price: Number(updated.price),
+          discount_price: updated.discount_price !== null ? Number(updated.discount_price) : null,
+          is_active: toBool(updated.is_active),
+        }
+      : null,
+  });
 }
 
 export async function DELETE(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.services');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.services');
+  if (error || !ctx || !ctx.business) return error!;
 
   const { searchParams } = new URL(req.url);
   const id = searchParams.get('id');
   if (!id) return NextResponse.json({ error: 'Hizmet kimliği gerekli.' }, { status: 400 });
 
-  const { error: delErr } = await db
-    .from('booking_services')
-    .delete()
-    .eq('id', id)
-    .eq('business_id', ctx.business.id);
-
-  if (delErr) return NextResponse.json({ error: delErr.message }, { status: 500 });
+  await execute('DELETE FROM booking_services WHERE id = ? AND business_id = ?', [
+    id,
+    ctx.business.id,
+  ]);
   return NextResponse.json({ success: true });
 }

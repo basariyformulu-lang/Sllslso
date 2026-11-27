@@ -86,6 +86,7 @@ export const DEFAULT_SECTION_VISIBILITY = {
   hero: true,
   services: true,
   staff: true,
+  instagram: true,
   gallery: true,
   reviews: true,
   hours: true,
@@ -161,4 +162,35 @@ export function sanitizeExternalUrl(url: string | null | undefined): string | nu
 export function formatTimeHHMM(timeStr: string | null | undefined): string {
   if (!timeStr) return '—';
   return timeStr.slice(0, 5);
+}
+
+export function normalizePhoneTR(raw: string | null | undefined): string {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('90') && digits.length >= 12) {
+    return digits.slice(2, 12);
+  }
+  if (digits.startsWith('0') && digits.length >= 11) {
+    return digits.slice(1, 11);
+  }
+  if (digits.length > 10) {
+    return digits.slice(-10);
+  }
+  return digits;
+}
+
+export function extractInstagramUsername(urlOrHandle: string | null | undefined): string {
+  if (!urlOrHandle) return '';
+  const cleaned = urlOrHandle
+    .trim()
+    .replace(/^https?:\/\/(www\.)?instagram\.com\//i, '')
+    .replace(/[/?#].*$/, '')
+    .replace(/^@+/, '');
+  return cleaned;
+}
+
+export function maskCustomerPhone(phone: string | null | undefined): string {
+  const norm = normalizePhoneTR(phone);
+  if (norm.length < 7) return '—';
+  return `0${norm.slice(0, 3)} *** ${norm.slice(-2)}`;
 }

@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireSystemAdmin } from '@/lib/auth-server';
+import {
+  execute,
+  parseJsonField,
+  queryOne,
+  toBool,
+  toIsoString,
+  toMySqlDateTime,
+  uuid,
+  writeAuditLog,
+} from '@/lib/db';
 import { roundCurrency } from '@/lib/format';
 
 const planUpdateSchema = z.object({
@@ -14,22 +24,27 @@ const planUpdateSchema = z.object({
 });
 
 export async function GET() {
-  const { error, db } = await requireSystemAdmin();
-  if (error || !db) return error!;
+  const { error } = await requireSystemAdmin();
+  if (error) return error;
 
-  const { data: plan, error: err } = await db
-    .from('subscription_plans')
-    .select('*')
-    .limit(1)
-    .maybeSingle();
-
-  if (err) return NextResponse.json({ error: err.message }, { status: 500 });
-  return NextResponse.json({ plan });
+  const plan = await queryOne<Record<string, unknown>>('SELECT * FROM subscription_plans LIMIT 1');
+  return NextResponse.json({
+    plan: plan
+      ? {
+          ...plan,
+          monthly_price: Number(plan.monthly_price ?? 0),
+          features: parseJsonField<string[]>(plan.features, []),
+          is_active: toBool(plan.is_active),
+          effective_from: String(plan.effective_from ?? '').slice(0, 10),
+          updated_at: toIsoString(plan.updated_at),
+        }
+      : null,
+  });
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireSystemAdmin();
-  if (error || !ctx || !db) return error!;
+  const { error, ctx } = await requireSystemAdmin();
+  if (error || !ctx) return error!;
 
   let body: unknown;
   try {
@@ -47,63 +62,81 @@ export async function PATCH(req: NextRequest) {
   }
 
   const d = parsed.data;
-  const { data: existing } = await db
-    .from('subscription_plans')
-    .select('*')
-    .limit(1)
-    .maybeSingle();
-
+  const existing = await queryOne<Record<string, unknown>>('SELECT * FROM subscription_plans LIMIT 1');
   const newPrice = roundCurrency(d.monthlyPrice);
+  const nowStr = toMySqlDateTime();
+  const effectiveSql = `${d.effectiveFrom} 00:00:00.000`;
 
   if (!existing) {
-    const { data: created, error: createErr } = await db
-      .from('subscription_plans')
-      .insert({
-        name: d.name,
-        description: d.description,
-        monthly_price: newPrice,
-        duration_days: d.durationDays,
-        features: d.features,
-        is_active: d.isActive,
-        effective_from: d.effectiveFrom,
-      })
-      .select('*')
-      .single();
-    if (createErr) return NextResponse.json({ error: createErr.message }, { status: 500 });
-    return NextResponse.json({ plan: created });
+    const planId = uuid();
+    await execute(
+      `INSERT INTO subscription_plans
+       (id, name, description, monthly_price, duration_days, features, is_active, effective_from, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        planId,
+        d.name,
+        d.description,
+        newPrice,
+        d.durationDays,
+        JSON.stringify(d.features),
+        d.isActive ? 1 : 0,
+        effectiveSql,
+        nowStr,
+        nowStr,
+      ]
+    );
+    const created = await queryOne<Record<string, unknown>>(
+      'SELECT * FROM subscription_plans WHERE id = ? LIMIT 1',
+      [planId]
+    );
+    return NextResponse.json({
+      plan: created
+        ? {
+            ...created,
+            monthly_price: Number(created.monthly_price ?? 0),
+            features: parseJsonField<string[]>(created.features, []),
+            is_active: toBool(created.is_active),
+            effective_from: d.effectiveFrom,
+          }
+        : null,
+    });
   }
 
-  const { data: updated, error: updErr } = await db
-    .from('subscription_plans')
-    .update({
-      name: d.name,
-      description: d.description,
-      monthly_price: newPrice,
-      duration_days: d.durationDays,
-      features: d.features,
-      is_active: d.isActive,
-      effective_from: d.effectiveFrom,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', existing.id)
-    .select('*')
-    .single();
+  await execute(
+    `UPDATE subscription_plans
+     SET name = ?, description = ?, monthly_price = ?, duration_days = ?, features = ?,
+         is_active = ?, effective_from = ?, updated_at = ?
+     WHERE id = ?`,
+    [
+      d.name,
+      d.description,
+      newPrice,
+      d.durationDays,
+      JSON.stringify(d.features),
+      d.isActive ? 1 : 0,
+      effectiveSql,
+      nowStr,
+      String(existing.id),
+    ]
+  );
 
-  if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
+  const updated = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM subscription_plans WHERE id = ? LIMIT 1',
+    [String(existing.id)]
+  );
 
-  // Mevcut aktif aboneliği devam eden işletmelerin kilitli fiyatı (locked_price) korunur.
-  await db.from('audit_logs').insert({
+  await writeAuditLog({
     scope: 'admin',
-    actor_user_id: ctx.userId,
-    actor_name: ctx.adminName ?? 'Sistem Yöneticisi',
+    actorUserId: ctx.userId,
+    actorName: ctx.adminName ?? 'Sistem Yöneticisi',
     action: 'subscription_plan_updated',
-    entity_type: 'subscription_plans',
-    entity_id: existing.id,
-    old_values: {
+    entityType: 'subscription_plans',
+    entityId: String(existing.id),
+    oldValues: {
       name: existing.name,
       monthly_price: existing.monthly_price,
-      is_active: existing.is_active,
-      effective_from: existing.effective_from,
+      is_active: toBool(existing.is_active),
     },
     new_values: {
       name: d.name,
@@ -112,7 +145,17 @@ export async function PATCH(req: NextRequest) {
       effective_from: d.effectiveFrom,
     },
     description: `Tek abonelik paketi güncellendi (Yeni fiyat: ${newPrice} TL, Geçerlilik: ${d.effectiveFrom}).`,
-  });
+  } as Parameters<typeof writeAuditLog>[0]);
 
-  return NextResponse.json({ plan: updated });
+  return NextResponse.json({
+    plan: updated
+      ? {
+          ...updated,
+          monthly_price: Number(updated.monthly_price ?? 0),
+          features: parseJsonField<string[]>(updated.features, []),
+          is_active: toBool(updated.is_active),
+          effective_from: d.effectiveFrom,
+        }
+      : null,
+  });
 }

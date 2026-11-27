@@ -1,42 +1,48 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { ArrowRight, Lock, Mail } from 'lucide-react';
-import { createBrowserSupabase, isSupabaseClientConfigured } from '@/lib/supabase/client';
 import { useToast } from '@/components/ToastProvider';
 import { SetupNotice } from '@/components/SetupNotice';
 
 export default function LoginPage() {
   const router = useRouter();
   const { showToast } = useToast();
-  const configured = isSupabaseClientConfigured();
-
+  const [configured, setConfigured] = useState<boolean>(true);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
+  useEffect(() => {
+    fetch('/api/auth/me', { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.configured === false) setConfigured(false);
+      })
+      .catch(() => {});
+  }, []);
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setErrorMsg('');
-
-    const supabase = createBrowserSupabase();
-    if (!supabase) {
-      setErrorMsg('Supabase bağlantısı yapılandırılmamış.');
-      return;
-    }
-
     setLoading(true);
+
     try {
-      const { error } = await supabase.auth.signInWithPassword({
-        email: email.trim().toLowerCase(),
-        password,
+      const loginRes = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: email.trim().toLowerCase(),
+          password,
+        }),
       });
 
-      if (error) {
-        setErrorMsg('E-posta adresi veya şifre hatalı.');
+      const loginData = await loginRes.json();
+      if (!loginRes.ok) {
+        setErrorMsg(loginData.error || 'E-posta adresi veya şifre hatalı.');
         return;
       }
 
@@ -50,20 +56,8 @@ export default function LoginPage() {
 
       showToast('Giriş başarılı', 'success');
 
-      if (meData.user.isSystemAdmin && !meData.user.member) {
-        router.push('/admin');
-        router.refresh();
-        return;
-      }
-
       if (meData.user.isSystemAdmin) {
         router.push('/admin');
-        router.refresh();
-        return;
-      }
-
-      if (!meData.user.member && meData.user.customerAccount) {
-        router.push('/musteri');
         router.refresh();
         return;
       }
@@ -130,7 +124,7 @@ export default function LoginPage() {
                     href="/sifre-sifirla"
                     className="text-xs font-medium text-[#0F2942] hover:underline"
                   >
-                    Şifremi Unuttum
+                    Şifremi Unuttum / İlk Şifre Belirle
                   </Link>
                 </div>
                 <div className="relative mt-1.5">
@@ -164,9 +158,9 @@ export default function LoginPage() {
                 </Link>
               </p>
               <p>
-                Randevu müşterisi misiniz?{' '}
+                Randevunuzu mu sorgulayacaksınız?{' '}
                 <Link href="/musteri" className="font-semibold text-emerald-700 hover:underline">
-                  Müşteri Randevu Portalı
+                  Telefon ile Randevu Sorgula
                 </Link>
               </p>
             </div>

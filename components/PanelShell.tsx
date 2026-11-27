@@ -29,7 +29,6 @@ import {
   Palette,
   SlidersHorizontal,
 } from 'lucide-react';
-import { createBrowserSupabase } from '@/lib/supabase/client';
 import { hasPermission } from '@/lib/permissions';
 import { formatDateTR } from '@/lib/format';
 import type { Business, BusinessMember } from '@/lib/types';
@@ -157,9 +156,9 @@ export function PanelShell({ children }: { children: React.ReactNode }) {
   }
 
   async function handleLogout() {
-    const supabase = createBrowserSupabase();
-    if (supabase) await supabase.auth.signOut();
+    await fetch('/api/auth/logout', { method: 'POST' });
     router.push('/giris');
+    router.refresh();
   }
 
   if (loading || !userCtx) {

@@ -13,7 +13,6 @@ import {
   Upload,
   ArrowRight,
 } from 'lucide-react';
-import { createBrowserSupabase } from '@/lib/supabase/client';
 import { formatCurrencyTRY, formatDateTR, getIstanbulTodayISO } from '@/lib/format';
 import { getSubscriptionStatusDisplay, StatusText } from '@/components/ui/StatusText';
 import { useToast } from '@/components/ToastProvider';
@@ -85,9 +84,9 @@ export default function OdemePage() {
   }, [loadData]);
 
   async function handleLogout() {
-    const supabase = createBrowserSupabase();
-    if (supabase) await supabase.auth.signOut();
+    await fetch('/api/auth/logout', { method: 'POST' });
     router.push('/giris');
+    router.refresh();
   }
 
   function handleCopyIban(id: string, iban: string) {

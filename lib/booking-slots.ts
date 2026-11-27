@@ -8,7 +8,7 @@ import type {
 export interface ExistingApptInterval {
   id: string;
   staff_id: string;
-  start_time: string; // HH:MM or HH:MM:SS
+  start_time: string;
   end_time: string;
   status: string;
 }
@@ -16,8 +16,10 @@ export interface ExistingApptInterval {
 export interface ComputedSlot {
   time: string; // HH:MM
   endTime: string; // HH:MM
+  available: boolean;
+  reason?: 'available' | 'booked' | 'past' | 'break' | 'off';
   availableStaffIds: string[];
-  recommendedStaffId: string;
+  recommendedStaffId: string | null;
 }
 
 function toMinutes(hhmm: string): number {
@@ -69,10 +71,10 @@ export function addDaysToISODate(dateISO: string, days: number): string {
   return `${yy}-${mm}-${dd}`;
 }
 
-export function computeAvailableSlots(params: {
+export function computeSlotMatrix(params: {
   dateISO: string;
   serviceDurationMinutes: number;
-  slotIntervalMinutes: number;
+  slotIntervalMinutes?: number;
   minAdvanceMinutes: number;
   maxAdvanceDays: number;
   businessHours: BookingBusinessHour[];
@@ -87,7 +89,7 @@ export function computeAvailableSlots(params: {
   const {
     dateISO,
     serviceDurationMinutes,
-    slotIntervalMinutes,
+    slotIntervalMinutes = 30,
     minAdvanceMinutes,
     maxAdvanceDays,
     businessHours,
@@ -100,6 +102,7 @@ export function computeAvailableSlots(params: {
     enforceAdvanceRules = true,
   } = params;
 
+  const step = Math.max(30, slotIntervalMinutes || 30);
   if (candidateStaffIds.length === 0) return [];
 
   const nowParts = getIstanbulNowParts();
@@ -109,7 +112,6 @@ export function computeAvailableSlots(params: {
     if (dateISO > maxDateISO) return [];
   }
 
-  // Tüm işletme tatili kontrolü
   const businessClosedOnDate = staffLeaves.some(
     (l) => !l.staff_id && dateISO >= l.start_date && dateISO <= l.end_date
   );
@@ -123,7 +125,6 @@ export function computeAvailableSlots(params: {
   const bizCloseMin = toMinutes(bizDay.close);
   if (bizCloseMin <= bizOpenMin) return [];
 
-  // Gün içindeki randevu yoğunluğuna göre personel dengeleme
   const apptCountByStaff = new Map<string, number>();
   candidateStaffIds.forEach((id) => apptCountByStaff.set(id, 0));
   existingAppointments.forEach((a) => {
@@ -145,23 +146,33 @@ export function computeAvailableSlots(params: {
   for (
     let startMin = bizOpenMin;
     startMin + serviceDurationMinutes <= bizCloseMin;
-    startMin += slotIntervalMinutes
+    startMin += step
   ) {
     const endMin = startMin + serviceDurationMinutes;
-    if (minAllowedTodayMin >= 0 && startMin < minAllowedTodayMin) {
+    const isPastSlot = minAllowedTodayMin >= 0 && startMin < minAllowedTodayMin;
+
+    if (isPastSlot) {
+      slots.push({
+        time: fromMinutes(startMin),
+        endTime: fromMinutes(endMin),
+        available: false,
+        reason: 'past',
+        availableStaffIds: [],
+        recommendedStaffId: null,
+      });
       continue;
     }
 
     const availableForSlot: string[] = [];
+    let anyBooked = false;
+    let anyBreak = false;
 
     for (const staffId of candidateStaffIds) {
-      // 1. Personel izni
       const onLeave = staffLeaves.some(
         (l) => l.staff_id === staffId && dateISO >= l.start_date && dateISO <= l.end_date
       );
       if (onLeave) continue;
 
-      // 2. Personel çalışma saati
       const wh = staffWorkingHours.find(
         (w) => w.staff_id === staffId && w.day_of_week === dow
       );
@@ -172,7 +183,6 @@ export function computeAvailableSlots(params: {
         if (startMin < staffOpen || endMin > staffClose) continue;
       }
 
-      // 3. Personel mola saati çakışması
       const hitsBreak = staffBreaks.some((b) => {
         if (b.staff_id !== staffId) return false;
         if (b.day_of_week !== null && b.day_of_week !== dow) return false;
@@ -180,9 +190,11 @@ export function computeAvailableSlots(params: {
         const bEnd = toMinutes(b.end_time);
         return startMin < bEnd && endMin > bStart;
       });
-      if (hitsBreak) continue;
+      if (hitsBreak) {
+        anyBreak = true;
+        continue;
+      }
 
-      // 4. Mevcut randevu çakışması
       const hitsAppt = existingAppointments.some((a) => {
         if (a.id === ignoreAppointmentId) return false;
         if (a.staff_id !== staffId) return false;
@@ -191,7 +203,10 @@ export function computeAvailableSlots(params: {
         const aEnd = toMinutes(a.end_time);
         return startMin < aEnd && endMin > aStart;
       });
-      if (hitsAppt) continue;
+      if (hitsAppt) {
+        anyBooked = true;
+        continue;
+      }
 
       availableForSlot.push(staffId);
     }
@@ -203,11 +218,31 @@ export function computeAvailableSlots(params: {
       slots.push({
         time: fromMinutes(startMin),
         endTime: fromMinutes(endMin),
+        available: true,
+        reason: 'available',
         availableStaffIds: sorted,
         recommendedStaffId: sorted[0],
+      });
+    } else {
+      slots.push({
+        time: fromMinutes(startMin),
+        endTime: fromMinutes(endMin),
+        available: false,
+        reason: anyBooked ? 'booked' : anyBreak ? 'break' : 'off',
+        availableStaffIds: [],
+        recommendedStaffId: null,
       });
     }
   }
 
   return slots;
+}
+
+export function computeAvailableSlots(
+  params: Parameters<typeof computeSlotMatrix>[0]
+): Array<ComputedSlot & { recommendedStaffId: string }> {
+  return computeSlotMatrix(params).filter(
+    (s): s is ComputedSlot & { recommendedStaffId: string } =>
+      s.available && Boolean(s.recommendedStaffId)
+  );
 }

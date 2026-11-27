@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireSystemAdmin } from '@/lib/auth-server';
+import {
+  execute,
+  parseJsonField,
+  query,
+  queryOne,
+  toBool,
+  toIsoString,
+  toMySqlDateTime,
+  writeAuditLog,
+} from '@/lib/db';
 import { roundCurrency } from '@/lib/format';
 
 const adminBookingPatchSchema = z.discriminatedUnion('action', [
@@ -29,44 +39,40 @@ const adminBookingPatchSchema = z.discriminatedUnion('action', [
 ]);
 
 export async function GET() {
-  const { error, db } = await requireSystemAdmin();
-  if (error || !db) return error!;
+  const { error } = await requireSystemAdmin();
+  if (error) return error;
 
-  const [
-    { data: businesses },
-    { data: pages },
-    { data: appointments },
-    { data: reviews },
-    { data: settings },
-  ] = await Promise.all([
-    db
-      .from('businesses')
-      .select('id, name, business_code, subscription_status, is_active, booking_module_enabled, booking_module_mode')
-      .order('created_at', { ascending: false }),
-    db.from('booking_pages').select('*'),
-    db.from('appointments').select('id, business_id, status'),
-    db
-      .from('appointment_reviews')
-      .select(
-        '*, business:businesses(name, business_code), appointment:appointments(service_name_snapshot, staff_name_snapshot), profile:profiles!appointment_reviews_customer_user_id_fkey(first_name, last_name)'
-      )
-      .order('created_at', { ascending: false })
-      .limit(100),
-    db
-      .from('system_settings')
-      .select('booking_module_default_included, booking_module_addon_price')
-      .eq('id', 1)
-      .maybeSingle(),
+  const [businesses, pages, appointments, reviews, settings] = await Promise.all([
+    query<Record<string, unknown>>(
+      'SELECT id, name, business_code, subscription_status, is_active, booking_module_enabled, booking_module_mode FROM businesses ORDER BY created_at DESC'
+    ),
+    query<Record<string, unknown>>('SELECT * FROM booking_pages'),
+    query<{ id: string; business_id: string; status: string }>(
+      'SELECT id, business_id, status FROM appointments'
+    ),
+    query<Record<string, unknown>>(
+      `SELECT r.*, b.name AS business_name, a.service_name_snapshot AS service_name, a.staff_name_snapshot AS staff_name
+       FROM appointment_reviews r
+       LEFT JOIN businesses b ON b.id = r.business_id
+       LEFT JOIN appointments a ON a.id = r.appointment_id
+       ORDER BY r.created_at DESC
+       LIMIT 100`
+    ),
+    queryOne<{
+      booking_module_default_included: number;
+      booking_module_addon_price: number;
+    }>('SELECT booking_module_default_included, booking_module_addon_price FROM system_settings WHERE id = 1 LIMIT 1'),
   ]);
 
-  const pageMap = new Map<string, NonNullable<typeof pages>[number]>();
-  (pages ?? []).forEach((p) => pageMap.set(p.business_id, p));
+  const pageMap = new Map<string, Record<string, unknown>>();
+  pages.forEach((p) => pageMap.set(String(p.business_id), p));
 
-  const businessRows = (businesses ?? []).map((b) => {
-    const page = pageMap.get(b.id) ?? null;
-    const bizAppts = (appointments ?? []).filter((a) => a.business_id === b.id);
-    const bizReviews = (reviews ?? []).filter(
-      (r) => r.business_id === b.id && r.moderation_status !== 'hidden'
+  const businessRows = businesses.map((b) => {
+    const bizId = String(b.id);
+    const page = pageMap.get(bizId) ?? null;
+    const bizAppts = appointments.filter((a) => a.business_id === bizId);
+    const bizReviews = reviews.filter(
+      (r) => String(r.business_id) === bizId && r.moderation_status !== 'hidden'
     );
     const avgRating =
       bizReviews.length > 0
@@ -76,7 +82,17 @@ export async function GET() {
         : 0;
     return {
       ...b,
-      page,
+      is_active: toBool(b.is_active),
+      booking_module_enabled: toBool(b.booking_module_enabled),
+      page: page
+        ? {
+            ...page,
+            gallery_images: parseJsonField(page.gallery_images, []),
+            section_visibility: parseJsonField(page.section_visibility, {}),
+            business_hours: parseJsonField(page.business_hours, []),
+            auto_confirm: toBool(page.auto_confirm),
+          }
+        : null,
       totalAppointments: bizAppts.length,
       completedAppointments: bizAppts.filter((a) => a.status === 'completed').length,
       reviewCount: bizReviews.length,
@@ -84,32 +100,29 @@ export async function GET() {
     };
   });
 
-  const formattedReviews = (reviews ?? []).map((r) => {
-    const biz = Array.isArray(r.business) ? r.business[0] : r.business;
-    const appt = Array.isArray(r.appointment) ? r.appointment[0] : r.appointment;
-    const prof = Array.isArray(r.profile) ? r.profile[0] : r.profile;
-    return {
-      ...r,
-      business_name: biz?.name ?? '—',
-      service_name: appt?.service_name_snapshot ?? '—',
-      staff_name: appt?.staff_name_snapshot ?? '—',
-      customer_name: prof ? `${prof.first_name} ${prof.last_name}`.trim() : 'Müşteri',
-    };
-  });
+  const formattedReviews = reviews.map((r) => ({
+    ...r,
+    rating: Number(r.rating ?? 5),
+    business_name: String(r.business_name ?? '—'),
+    service_name: String(r.service_name ?? '—'),
+    staff_name: String(r.staff_name ?? '—'),
+    customer_name: String(r.customer_name ?? 'Müşteri'),
+    created_at: toIsoString(r.created_at),
+  }));
 
   return NextResponse.json({
     businesses: businessRows,
     reviews: formattedReviews,
     globalSettings: {
-      defaultIncluded: settings?.booking_module_default_included !== false,
+      defaultIncluded: settings ? toBool(settings.booking_module_default_included) : true,
       addonPrice: Number(settings?.booking_module_addon_price ?? 0),
     },
   });
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireSystemAdmin();
-  if (error || !ctx || !db) return error!;
+  const { error, ctx } = await requireSystemAdmin();
+  if (error || !ctx) return error!;
 
   let body: unknown;
   try {
@@ -124,27 +137,23 @@ export async function PATCH(req: NextRequest) {
   }
 
   const d = parsed.data;
+  const nowStr = toMySqlDateTime();
 
   if (d.action === 'toggle_business_module') {
-    const { error: err } = await db
-      .from('businesses')
-      .update({
-        booking_module_enabled: d.bookingModuleEnabled,
-        booking_module_mode: d.bookingModuleMode,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', d.businessId);
-    if (err) return NextResponse.json({ error: err.message }, { status: 500 });
+    await execute(
+      'UPDATE businesses SET booking_module_enabled = ?, booking_module_mode = ?, updated_at = ? WHERE id = ?',
+      [d.bookingModuleEnabled ? 1 : 0, d.bookingModuleMode, nowStr, d.businessId]
+    );
 
-    await db.from('audit_logs').insert({
+    await writeAuditLog({
       scope: 'admin',
-      business_id: d.businessId,
-      actor_user_id: ctx.userId,
-      actor_name: ctx.adminName ?? 'Sistem Yöneticisi',
+      businessId: d.businessId,
+      actorUserId: ctx.userId,
+      actorName: ctx.adminName ?? 'Sistem Yöneticisi',
       action: 'booking_module_access_updated',
-      entity_type: 'businesses',
-      entity_id: d.businessId,
-      new_values: {
+      entityType: 'businesses',
+      entityId: d.businessId,
+      newValues: {
         booking_module_enabled: d.bookingModuleEnabled,
         booking_module_mode: d.bookingModuleMode,
       },
@@ -155,48 +164,38 @@ export async function PATCH(req: NextRequest) {
   }
 
   if (d.action === 'toggle_page_status') {
-    const { error: err } = await db
-      .from('booking_pages')
-      .update({ status: d.status, updated_at: new Date().toISOString() })
-      .eq('business_id', d.businessId);
-    if (err) return NextResponse.json({ error: err.message }, { status: 500 });
+    await execute(
+      'UPDATE booking_pages SET status = ?, updated_at = ? WHERE business_id = ?',
+      [d.status, nowStr, d.businessId]
+    );
     return NextResponse.json({ success: true });
   }
 
   if (d.action === 'update_global_settings') {
-    const { error: err } = await db
-      .from('system_settings')
-      .update({
-        booking_module_default_included: d.defaultIncluded,
-        booking_module_addon_price: roundCurrency(d.addonPrice),
-        updated_by: ctx.userId,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', 1);
-    if (err) return NextResponse.json({ error: err.message }, { status: 500 });
+    await execute(
+      `UPDATE system_settings
+       SET booking_module_default_included = ?, booking_module_addon_price = ?, updated_by = ?, updated_at = ?
+       WHERE id = 1`,
+      [d.defaultIncluded ? 1 : 0, roundCurrency(d.addonPrice), ctx.userId, nowStr]
+    );
     return NextResponse.json({ success: true });
   }
 
-  const { error: revErr } = await db
-    .from('appointment_reviews')
-    .update({
-      moderation_status: d.moderationStatus,
-      moderation_note: d.moderationNote,
-      moderated_by: ctx.userId,
-      moderated_at: new Date().toISOString(),
-    })
-    .eq('id', d.reviewId);
+  await execute(
+    `UPDATE appointment_reviews
+     SET moderation_status = ?, moderation_note = ?, moderated_by = ?, moderated_at = ?
+     WHERE id = ?`,
+    [d.moderationStatus, d.moderationNote, ctx.userId, nowStr, d.reviewId]
+  );
 
-  if (revErr) return NextResponse.json({ error: revErr.message }, { status: 500 });
-
-  await db.from('audit_logs').insert({
+  await writeAuditLog({
     scope: 'admin',
-    actor_user_id: ctx.userId,
-    actor_name: ctx.adminName ?? 'Sistem Yöneticisi',
+    actorUserId: ctx.userId,
+    actorName: ctx.adminName ?? 'Sistem Yöneticisi',
     action: 'review_moderated',
-    entity_type: 'appointment_reviews',
-    entity_id: d.reviewId,
-    new_values: { moderation_status: d.moderationStatus, moderation_note: d.moderationNote },
+    entityType: 'appointment_reviews',
+    entityId: d.reviewId,
+    newValues: { moderation_status: d.moderationStatus, moderation_note: d.moderationNote },
     description: 'Müşteri yorumu platform yöneticisi tarafından incelendi.',
   });
 

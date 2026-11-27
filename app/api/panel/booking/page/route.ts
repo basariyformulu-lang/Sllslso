@@ -2,11 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessBookingContext } from '@/lib/auth-server';
 import {
-  DEFAULT_BUSINESS_HOURS,
-  DEFAULT_SECTION_VISIBILITY,
+  extractInstagramUsername,
   sanitizeExternalUrl,
   slugifyBookingTitle,
 } from '@/lib/booking-helpers';
+import { ensureBookingPageMysql, formatBookingPageRow } from '@/lib/booking-mysql';
+import { execute, query, queryOne, toBool, toIsoString, toMySqlDateTime } from '@/lib/db';
 
 const businessHourSchema = z.object({
   day: z.number().int().min(0).max(6),
@@ -21,6 +22,13 @@ const galleryItemSchema = z.object({
   url: z.string().min(1).max(2_000_000),
   caption: z.string().max(160).optional().default(''),
   sort_order: z.number().int().min(0),
+});
+
+const instagramPostSchema = z.object({
+  id: z.string().min(1).max(80),
+  image_url: z.string().min(1).max(2_000_000),
+  caption: z.string().max(240).optional().default(''),
+  post_url: z.string().max(400).optional().default(''),
 });
 
 const updatePageSchema = z.object({
@@ -40,6 +48,12 @@ const updatePageSchema = z.object({
   address: z.string().trim().max(300).optional(),
   map_location: z.string().trim().max(500).optional(),
   instagram_url: z.string().trim().max(300).optional(),
+  instagram_username: z.string().trim().max(120).optional(),
+  instagram_display_name: z.string().trim().max(160).optional(),
+  instagram_avatar_url: z.string().max(2_000_000).optional(),
+  instagram_followers_count: z.coerce.number().int().min(0).max(50_000_000).optional(),
+  instagram_posts_count: z.coerce.number().int().min(0).max(1_000_000).optional(),
+  instagram_posts: z.array(instagramPostSchema).max(6).optional(),
   theme_preset: z
     .enum(['classic_navy', 'botanical_emerald', 'warm_atelier', 'minimal_mono', 'soft_rose'])
     .optional(),
@@ -50,6 +64,7 @@ const updatePageSchema = z.object({
       hero: z.boolean(),
       services: z.boolean(),
       staff: z.boolean(),
+      instagram: z.boolean().optional().default(true),
       gallery: z.boolean(),
       reviews: z.boolean(),
       hours: z.boolean(),
@@ -60,7 +75,7 @@ const updatePageSchema = z.object({
   slot_interval_minutes: z.coerce
     .number()
     .int()
-    .refine((v) => [10, 15, 20, 30, 45, 60].includes(v))
+    .refine((v) => [30, 45, 60].includes(v), 'Randevu aralığı 30, 45 veya 60 dakika olmalıdır.')
     .optional(),
   min_advance_minutes: z.coerce.number().int().min(0).max(10080).optional(),
   max_advance_days: z.coerce.number().int().min(1).max(180).optional(),
@@ -70,97 +85,55 @@ const updatePageSchema = z.object({
   service_order_ids: z.array(z.string().uuid()).optional(),
 });
 
-async function ensureBookingPage(
-  db: NonNullable<Awaited<ReturnType<typeof requireBusinessBookingContext>>['db']>,
-  business: NonNullable<Awaited<ReturnType<typeof requireBusinessBookingContext>>['ctx']>['business']
-) {
-  if (!business) return null;
-  const { data: existing } = await db
-    .from('booking_pages')
-    .select('*')
-    .eq('business_id', business.id)
-    .maybeSingle();
-
-  if (existing) return existing;
-
-  const baseSlug = slugifyBookingTitle(business.name) || business.business_code.toLowerCase();
-  let candidate = baseSlug;
-  for (let i = 0; i < 6; i++) {
-    const { data: clash } = await db
-      .from('booking_pages')
-      .select('id')
-      .eq('slug', candidate)
-      .maybeSingle();
-    if (!clash) break;
-    candidate = `${baseSlug}-${Math.floor(100 + Math.random() * 899)}`;
-  }
-
-  const { data: created } = await db
-    .from('booking_pages')
-    .insert({
-      business_id: business.id,
-      slug: candidate,
-      page_title: business.name,
-      phone: business.phone || '',
-      address: business.address || '',
-      business_hours: DEFAULT_BUSINESS_HOURS,
-      section_visibility: DEFAULT_SECTION_VISIBILITY,
-      status: 'draft',
-    })
-    .select('*')
-    .single();
-
-  return created;
-}
-
 export async function GET() {
-  const { error, ctx, db, readOnly } = await requireBusinessBookingContext('booking.view', true);
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx, readOnly } = await requireBusinessBookingContext('booking.view', true);
+  if (error || !ctx || !ctx.business) return error!;
 
-  let page = await db
-    .from('booking_pages')
-    .select('*')
-    .eq('business_id', ctx.business.id)
-    .maybeSingle()
-    .then((r) => r.data);
+  let pageRow = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM booking_pages WHERE business_id = ? LIMIT 1',
+    [ctx.business.id]
+  );
 
+  let page = pageRow ? formatBookingPageRow(pageRow) : null;
   if (!page && !readOnly) {
-    page = await ensureBookingPage(db, ctx.business);
+    page = await ensureBookingPageMysql(ctx.business);
   }
 
-  const [{ data: services }, { data: staff }, { data: reviews }] = await Promise.all([
-    db
-      .from('booking_services')
-      .select('*')
-      .eq('business_id', ctx.business.id)
-      .order('sort_order', { ascending: true })
-      .order('created_at', { ascending: true }),
-    db
-      .from('booking_staff')
-      .select('*')
-      .eq('business_id', ctx.business.id)
-      .order('sort_order', { ascending: true }),
-    db
-      .from('appointment_reviews')
-      .select('id, rating, comment, business_reply, created_at, moderation_status')
-      .eq('business_id', ctx.business.id)
-      .neq('moderation_status', 'hidden')
-      .order('created_at', { ascending: false })
-      .limit(10),
+  const [services, staff, reviews] = await Promise.all([
+    query<Record<string, unknown>>(
+      'SELECT * FROM booking_services WHERE business_id = ? ORDER BY sort_order ASC, created_at ASC',
+      [ctx.business.id]
+    ),
+    query<Record<string, unknown>>(
+      'SELECT * FROM booking_staff WHERE business_id = ? ORDER BY sort_order ASC',
+      [ctx.business.id]
+    ),
+    query<Record<string, unknown>>(
+      `SELECT id, rating, comment, business_reply, created_at, moderation_status, customer_name
+       FROM appointment_reviews
+       WHERE business_id = ? AND moderation_status <> 'hidden'
+       ORDER BY created_at DESC LIMIT 10`,
+      [ctx.business.id]
+    ),
   ]);
 
   return NextResponse.json({
     readOnly,
     page,
-    services: services ?? [],
-    staff: staff ?? [],
-    reviews: reviews ?? [],
+    services: services.map((s) => ({
+      ...s,
+      price: Number(s.price),
+      discount_price: s.discount_price !== null ? Number(s.discount_price) : null,
+      is_active: toBool(s.is_active),
+    })),
+    staff: staff.map((st) => ({ ...st, is_active: toBool(st.is_active) })),
+    reviews: reviews.map((r) => ({ ...r, created_at: toIsoString(r.created_at) })),
   });
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.design');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.design');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -177,15 +150,14 @@ export async function PATCH(req: NextRequest) {
     );
   }
 
-  const page = await ensureBookingPage(db, ctx.business);
+  const page = await ensureBookingPageMysql(ctx.business);
   if (!page) {
     return NextResponse.json({ error: 'Randevu sayfası oluşturulamadı.' }, { status: 500 });
   }
 
   const d = parsed.data;
-  const patch: Record<string, unknown> = {
-    updated_at: new Date().toISOString(),
-  };
+  const setClauses: string[] = ['updated_at = ?'];
+  const values: unknown[] = [toMySqlDateTime()];
 
   if (d.slug !== undefined) {
     const cleanSlug = slugifyBookingTitle(d.slug);
@@ -195,27 +167,38 @@ export async function PATCH(req: NextRequest) {
         { status: 400 }
       );
     }
-    const { data: clash } = await db
-      .from('booking_pages')
-      .select('id')
-      .eq('slug', cleanSlug)
-      .neq('id', page.id)
-      .maybeSingle();
+    const clash = await queryOne<{ id: string }>(
+      'SELECT id FROM booking_pages WHERE slug = ? AND id <> ? LIMIT 1',
+      [cleanSlug, page.id]
+    );
     if (clash) {
       return NextResponse.json(
         { error: 'Bu randevu sayfası bağlantısı başka bir işletme tarafından kullanılıyor.' },
         { status: 409 }
       );
     }
-    patch.slug = cleanSlug;
+    setClauses.push('slug = ?');
+    values.push(cleanSlug);
   }
 
-  if (d.page_title !== undefined) patch.page_title = d.page_title;
-  if (d.description !== undefined) patch.description = d.description;
-  if (d.logo_url !== undefined) patch.logo_url = sanitizeExternalUrl(d.logo_url) ?? '';
-  if (d.cover_image_url !== undefined) patch.cover_image_url = sanitizeExternalUrl(d.cover_image_url) ?? '';
+  if (d.page_title !== undefined) {
+    setClauses.push('page_title = ?');
+    values.push(d.page_title);
+  }
+  if (d.description !== undefined) {
+    setClauses.push('description = ?');
+    values.push(d.description);
+  }
+  if (d.logo_url !== undefined) {
+    setClauses.push('logo_url = ?');
+    values.push(sanitizeExternalUrl(d.logo_url) ?? '');
+  }
+  if (d.cover_image_url !== undefined) {
+    setClauses.push('cover_image_url = ?');
+    values.push(sanitizeExternalUrl(d.cover_image_url) ?? '');
+  }
   if (d.gallery_images !== undefined) {
-    patch.gallery_images = d.gallery_images
+    const cleaned = d.gallery_images
       .map((item, idx) => ({
         id: item.id,
         url: sanitizeExternalUrl(item.url) ?? '',
@@ -223,48 +206,135 @@ export async function PATCH(req: NextRequest) {
         sort_order: idx,
       }))
       .filter((item) => item.url.length > 0);
+    setClauses.push('gallery_images = ?');
+    values.push(JSON.stringify(cleaned));
   }
-  if (d.phone !== undefined) patch.phone = d.phone;
-  if (d.whatsapp !== undefined) patch.whatsapp = d.whatsapp;
-  if (d.address !== undefined) patch.address = d.address;
-  if (d.map_location !== undefined) patch.map_location = d.map_location;
+  if (d.phone !== undefined) {
+    setClauses.push('phone = ?');
+    values.push(d.phone);
+  }
+  if (d.whatsapp !== undefined) {
+    setClauses.push('whatsapp = ?');
+    values.push(d.whatsapp);
+  }
+  if (d.address !== undefined) {
+    setClauses.push('address = ?');
+    values.push(d.address);
+  }
+  if (d.map_location !== undefined) {
+    setClauses.push('map_location = ?');
+    values.push(d.map_location);
+  }
   if (d.instagram_url !== undefined) {
-    patch.instagram_url = d.instagram_url ? (sanitizeExternalUrl(d.instagram_url) ?? d.instagram_url) : '';
+    const normalizedUrl = d.instagram_url
+      ? (sanitizeExternalUrl(d.instagram_url) ?? d.instagram_url)
+      : '';
+    setClauses.push('instagram_url = ?');
+    values.push(normalizedUrl);
+    if (d.instagram_username === undefined && normalizedUrl) {
+      const extracted = extractInstagramUsername(normalizedUrl);
+      if (extracted) {
+        setClauses.push('instagram_username = ?');
+        values.push(extracted);
+      }
+    }
   }
-  if (d.theme_preset !== undefined) patch.theme_preset = d.theme_preset;
-  if (d.primary_color !== undefined) patch.primary_color = d.primary_color;
-  if (d.secondary_color !== undefined) patch.secondary_color = d.secondary_color;
-  if (d.section_visibility !== undefined) patch.section_visibility = d.section_visibility;
-  if (d.business_hours !== undefined) patch.business_hours = d.business_hours;
-  if (d.slot_interval_minutes !== undefined) patch.slot_interval_minutes = d.slot_interval_minutes;
-  if (d.min_advance_minutes !== undefined) patch.min_advance_minutes = d.min_advance_minutes;
-  if (d.max_advance_days !== undefined) patch.max_advance_days = d.max_advance_days;
+  if (d.instagram_username !== undefined) {
+    setClauses.push('instagram_username = ?');
+    values.push(extractInstagramUsername(d.instagram_username));
+  }
+  if (d.instagram_display_name !== undefined) {
+    setClauses.push('instagram_display_name = ?');
+    values.push(d.instagram_display_name);
+  }
+  if (d.instagram_avatar_url !== undefined) {
+    setClauses.push('instagram_avatar_url = ?');
+    values.push(sanitizeExternalUrl(d.instagram_avatar_url) ?? '');
+  }
+  if (d.instagram_followers_count !== undefined) {
+    setClauses.push('instagram_followers_count = ?');
+    values.push(d.instagram_followers_count);
+  }
+  if (d.instagram_posts_count !== undefined) {
+    setClauses.push('instagram_posts_count = ?');
+    values.push(d.instagram_posts_count);
+  }
+  if (d.instagram_posts !== undefined) {
+    const cleanedPosts = d.instagram_posts
+      .slice(0, 6)
+      .map((p) => ({
+        id: p.id,
+        image_url: sanitizeExternalUrl(p.image_url) ?? '',
+        caption: p.caption ?? '',
+        post_url: p.post_url ? (sanitizeExternalUrl(p.post_url) ?? '') : '',
+      }))
+      .filter((p) => p.image_url.length > 0);
+    setClauses.push('instagram_posts = ?');
+    values.push(JSON.stringify(cleanedPosts));
+  }
+  if (d.theme_preset !== undefined) {
+    setClauses.push('theme_preset = ?');
+    values.push(d.theme_preset);
+  }
+  if (d.primary_color !== undefined) {
+    setClauses.push('primary_color = ?');
+    values.push(d.primary_color);
+  }
+  if (d.secondary_color !== undefined) {
+    setClauses.push('secondary_color = ?');
+    values.push(d.secondary_color);
+  }
+  if (d.section_visibility !== undefined) {
+    setClauses.push('section_visibility = ?');
+    values.push(JSON.stringify(d.section_visibility));
+  }
+  if (d.business_hours !== undefined) {
+    setClauses.push('business_hours = ?');
+    values.push(JSON.stringify(d.business_hours));
+  }
+  if (d.slot_interval_minutes !== undefined) {
+    setClauses.push('slot_interval_minutes = ?');
+    values.push(d.slot_interval_minutes);
+  }
+  if (d.min_advance_minutes !== undefined) {
+    setClauses.push('min_advance_minutes = ?');
+    values.push(d.min_advance_minutes);
+  }
+  if (d.max_advance_days !== undefined) {
+    setClauses.push('max_advance_days = ?');
+    values.push(d.max_advance_days);
+  }
   if (d.cancellation_deadline_hours !== undefined) {
-    patch.cancellation_deadline_hours = d.cancellation_deadline_hours;
+    setClauses.push('cancellation_deadline_hours = ?');
+    values.push(d.cancellation_deadline_hours);
   }
-  if (d.auto_confirm !== undefined) patch.auto_confirm = d.auto_confirm;
-  if (d.status !== undefined) patch.status = d.status;
+  if (d.auto_confirm !== undefined) {
+    setClauses.push('auto_confirm = ?');
+    values.push(d.auto_confirm ? 1 : 0);
+  }
+  if (d.status !== undefined) {
+    setClauses.push('status = ?');
+    values.push(d.status);
+  }
 
-  const { data: updated, error: updErr } = await db
-    .from('booking_pages')
-    .update(patch)
-    .eq('id', page.id)
-    .select('*')
-    .single();
-
-  if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
+  values.push(page.id);
+  await execute(`UPDATE booking_pages SET ${setClauses.join(', ')} WHERE id = ?`, values);
 
   if (d.service_order_ids && d.service_order_ids.length > 0) {
     await Promise.all(
       d.service_order_ids.map((sid, idx) =>
-        db
-          .from('booking_services')
-          .update({ sort_order: idx })
-          .eq('id', sid)
-          .eq('business_id', ctx.business!.id)
+        execute(
+          'UPDATE booking_services SET sort_order = ? WHERE id = ? AND business_id = ?',
+          [idx, sid, ctx.business!.id]
+        )
       )
     );
   }
 
-  return NextResponse.json({ page: updated });
+  const updatedRow = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM booking_pages WHERE id = ? LIMIT 1',
+    [page.id]
+  );
+
+  return NextResponse.json({ page: updatedRow ? formatBookingPageRow(updatedRow) : page });
 }

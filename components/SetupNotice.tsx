@@ -13,20 +13,22 @@ export function SetupNotice({ context = 'sistem' }: { context?: string }) {
         </div>
         <div>
           <h2 className="text-base font-semibold text-slate-900">
-            Supabase Bağlantısı Yapılandırılmamış
+            MySQL Veritabanı Bağlantısı Yapılandırılmamış
           </h2>
           <p className="mt-1.5 text-sm leading-relaxed text-slate-600">
             {context} işlemlerinin gerçek veritabanı ve kimlik doğrulama ile çalışabilmesi için
-            ortam değişkenlerinin tanımlanması gerekiyor.
+            sunucu ortam değişkenlerinin tanımlanması gerekiyor.
           </p>
           <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-700 space-y-1">
-            <div>NEXT_PUBLIC_SUPABASE_URL</div>
-            <div>NEXT_PUBLIC_SUPABASE_ANON_KEY</div>
-            <div>SUPABASE_SERVICE_ROLE_KEY</div>
+            <div>MYSQL_HOST</div>
+            <div>MYSQL_DATABASE</div>
+            <div>MYSQL_USER</div>
+            <div>MYSQL_PASSWORD</div>
           </div>
           <p className="mt-3 text-xs text-slate-500">
-            Ayrıca proje dizinindeki <code className="font-mono">supabase/migrations/</code>{' '}
-            klasöründeki SQL dosyalarını Supabase SQL Editor üzerinden sırayla çalıştırın.
+            Ortam değişkenleri eklendikten sonra <code className="font-mono">/admin</code>{' '}
+            sayfasından tek tıkla <code className="font-mono">mysql/schema.sql</code> tablolarını
+            kurabilirsiniz.
           </p>
           <div className="mt-4">
             <Link

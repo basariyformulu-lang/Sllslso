@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { requireBusinessBookingContext } from '@/lib/auth-server';
+import { execute, query, queryOne, toIsoString, toMySqlDateTime } from '@/lib/db';
 
 const reviewActionSchema = z.discriminatedUnion('action', [
   z.object({
@@ -16,34 +17,37 @@ const reviewActionSchema = z.discriminatedUnion('action', [
 ]);
 
 export async function GET() {
-  const { error, ctx, db, readOnly } = await requireBusinessBookingContext('booking.view', true);
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx, readOnly } = await requireBusinessBookingContext('booking.view', true);
+  if (error || !ctx || !ctx.business) return error!;
 
   const businessId = ctx.business.id;
-  const { data: reviews } = await db
-    .from('appointment_reviews')
-    .select(
-      '*, appointment:appointments(service_name_snapshot, staff_name_snapshot, appointment_date), profile:profiles!appointment_reviews_customer_user_id_fkey(first_name, last_name)'
-    )
-    .eq('business_id', businessId)
-    .order('created_at', { ascending: false });
+  const rows = await query<Record<string, unknown>>(
+    `SELECT r.*, a.service_name_snapshot, a.staff_name_snapshot, a.appointment_date, a.customer_name AS appt_customer_name
+     FROM appointment_reviews r
+     LEFT JOIN appointments a ON a.id = r.appointment_id
+     WHERE r.business_id = ?
+     ORDER BY r.created_at DESC`,
+    [businessId]
+  );
 
-  const list = (reviews ?? []).map((r) => {
-    const prof = Array.isArray(r.profile) ? r.profile[0] : r.profile;
-    const appt = Array.isArray(r.appointment) ? r.appointment[0] : r.appointment;
-    return {
-      ...r,
-      customer_name: prof ? `${prof.first_name} ${prof.last_name}`.trim() : 'Müşteri',
-      service_name: appt?.service_name_snapshot ?? '',
-      staff_name: appt?.staff_name_snapshot ?? '',
-      appointment_date: appt?.appointment_date ?? null,
-    };
-  });
+  const list = rows.map((r) => ({
+    ...r,
+    rating: Number(r.rating),
+    created_at: toIsoString(r.created_at),
+    replied_at: toIsoString(r.replied_at),
+    reported_at: toIsoString(r.reported_at),
+    customer_name: String(r.customer_name || r.appt_customer_name || 'Müşteri'),
+    service_name: String(r.service_name_snapshot ?? ''),
+    staff_name: String(r.staff_name_snapshot ?? ''),
+    appointment_date: r.appointment_date ?? null,
+    moderation_status: String(r.moderation_status ?? 'published'),
+  }));
 
   const visible = list.filter((r) => r.moderation_status !== 'hidden');
   const averageRating =
     visible.length > 0
-      ? Math.round((visible.reduce((acc, r) => acc + Number(r.rating), 0) / visible.length) * 10) / 10
+      ? Math.round((visible.reduce((acc, r) => acc + Number(r.rating), 0) / visible.length) * 10) /
+        10
       : 0;
 
   return NextResponse.json({
@@ -58,8 +62,8 @@ export async function GET() {
 }
 
 export async function PATCH(req: NextRequest) {
-  const { error, ctx, db } = await requireBusinessBookingContext('booking.manage');
-  if (error || !ctx || !db || !ctx.business) return error!;
+  const { error, ctx } = await requireBusinessBookingContext('booking.manage');
+  if (error || !ctx || !ctx.business) return error!;
 
   let body: unknown;
   try {
@@ -78,48 +82,40 @@ export async function PATCH(req: NextRequest) {
 
   const d = parsed.data;
   const businessId = ctx.business.id;
-
-  const { data: existing } = await db
-    .from('appointment_reviews')
-    .select('id, moderation_status')
-    .eq('id', d.reviewId)
-    .eq('business_id', businessId)
-    .maybeSingle();
+  const existing = await queryOne<{ id: string }>(
+    'SELECT id FROM appointment_reviews WHERE id = ? AND business_id = ? LIMIT 1',
+    [d.reviewId, businessId]
+  );
 
   if (!existing) {
     return NextResponse.json({ error: 'Yorum bulunamadı.' }, { status: 404 });
   }
 
+  const nowStr = toMySqlDateTime();
+
   if (d.action === 'reply') {
-    const { data: updated, error: updErr } = await db
-      .from('appointment_reviews')
-      .update({
-        business_reply: d.businessReply,
-        replied_at: new Date().toISOString(),
-        replied_by: ctx.userId,
-      })
-      .eq('id', d.reviewId)
-      .eq('business_id', businessId)
-      .select('*')
-      .single();
-    if (updErr) return NextResponse.json({ error: updErr.message }, { status: 500 });
+    await execute(
+      `UPDATE appointment_reviews
+       SET business_reply = ?, replied_at = ?, replied_by = ?
+       WHERE id = ? AND business_id = ?`,
+      [d.businessReply, nowStr, ctx.userId, d.reviewId, businessId]
+    );
+    const updated = await queryOne<Record<string, unknown>>(
+      'SELECT * FROM appointment_reviews WHERE id = ? LIMIT 1',
+      [d.reviewId]
+    );
     return NextResponse.json({ review: updated });
   }
 
-  // İşletme yorumu silemez veya puanı değiştiremez; yalnızca platform yöneticisine bildirebilir
-  const { data: reported, error: repErr } = await db
-    .from('appointment_reviews')
-    .update({
-      moderation_status: 'reported',
-      report_reason: d.reportReason,
-      reported_at: new Date().toISOString(),
-      reported_by: ctx.userId,
-    })
-    .eq('id', d.reviewId)
-    .eq('business_id', businessId)
-    .select('*')
-    .single();
-
-  if (repErr) return NextResponse.json({ error: repErr.message }, { status: 500 });
+  await execute(
+    `UPDATE appointment_reviews
+     SET moderation_status = 'reported', report_reason = ?, reported_at = ?, reported_by = ?
+     WHERE id = ? AND business_id = ?`,
+    [d.reportReason, nowStr, ctx.userId, d.reviewId, businessId]
+  );
+  const reported = await queryOne<Record<string, unknown>>(
+    'SELECT * FROM appointment_reviews WHERE id = ? LIMIT 1',
+    [d.reviewId]
+  );
   return NextResponse.json({ review: reported });
 }

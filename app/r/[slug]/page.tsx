@@ -8,24 +8,20 @@ import {
   CheckCircle2,
   ChevronLeft,
   Clock,
-  Lock,
+  Phone,
   Scissors,
+  Star,
   UserCheck,
   X,
 } from 'lucide-react';
 import {
   BookingStorefrontRenderer,
+  type StorefrontRatingSummary,
   type StorefrontReview,
 } from '@/components/BookingStorefrontRenderer';
 import { useToast } from '@/components/ToastProvider';
-import { createBrowserSupabase } from '@/lib/supabase/client';
 import { formatCurrencyTRY, formatDateTR, getIstanbulTodayISO } from '@/lib/format';
-import type {
-  BookingPage,
-  BookingService,
-  BookingStaff,
-  CustomerAccount,
-} from '@/lib/types';
+import type { BookingPage, BookingService, BookingStaff } from '@/lib/types';
 
 interface PublicBookingPayload {
   page: BookingPage;
@@ -34,11 +30,25 @@ interface PublicBookingPayload {
   services: BookingService[];
   staff: BookingStaff[];
   reviews: StorefrontReview[];
+  ratingSummary?: StorefrontRatingSummary;
 }
 
-interface SlotItem {
+interface SlotMatrixItem {
   time: string;
+  endTime?: string;
+  available: boolean;
+  reason?: 'available' | 'booked' | 'past' | 'break' | 'off';
   availableStaffIds: string[];
+  recommendedStaffId?: string | null;
+}
+
+interface EligibleReviewAppointment {
+  id: string;
+  service_name_snapshot: string;
+  staff_name_snapshot: string;
+  appointment_date: string;
+  start_time: string;
+  customer_name: string;
 }
 
 function addDaysISO(iso: string, days: number): string {
@@ -56,18 +66,20 @@ export default function PublicBookingStorefrontPage() {
   const [loading, setLoading] = useState(true);
   const [notFoundErr, setNotFoundErr] = useState(false);
   const [payload, setPayload] = useState<PublicBookingPayload | null>(null);
-  const [customerAcc, setCustomerAcc] = useState<CustomerAccount | null>(null);
 
-  // Randevu Sihirbazı Durumu
+  // Randevu Sihirbazı Durumu (Hesapsız / Sadece Ad Soyad + Telefon)
   const [wizardOpen, setWizardOpen] = useState(false);
   const [step, setStep] = useState<1 | 2 | 3 | 4 | 5>(1);
   const [selectedServiceId, setSelectedServiceId] = useState('');
   const [selectedStaffId, setSelectedStaffId] = useState('any');
   const [selectedDate, setSelectedDate] = useState(todayISO);
   const [selectedTime, setSelectedTime] = useState('');
+
+  const [fullName, setFullName] = useState('');
+  const [phone, setPhone] = useState('');
   const [customerNotes, setCustomerNotes] = useState('');
 
-  const [slots, setSlots] = useState<SlotItem[]>([]);
+  const [slotMatrix, setSlotMatrix] = useState<SlotMatrixItem[]>([]);
   const [loadingSlots, setLoadingSlots] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [confirmedAppt, setConfirmedAppt] = useState<{
@@ -79,38 +91,31 @@ export default function PublicBookingStorefrontPage() {
     status: string;
   } | null>(null);
 
-  // Adım 4: Müşteri Giriş / Kayıt
-  const [authTab, setAuthTab] = useState<'login' | 'register'>('login');
-  const [authBusy, setAuthBusy] = useState(false);
-  const [loginForm, setLoginForm] = useState({ email: '', password: '' });
-  const [registerForm, setRegisterForm] = useState({
-    firstName: '',
-    lastName: '',
-    phone: '',
-    email: '',
-    password: '',
-    confirmPassword: '',
-  });
+  // Telefon Doğrulamalı Puan & Yorum Modalı
+  const [reviewModalOpen, setReviewModalOpen] = useState(false);
+  const [reviewPhone, setReviewPhone] = useState('');
+  const [reviewChecking, setReviewChecking] = useState(false);
+  const [reviewCheckDone, setReviewCheckDone] = useState(false);
+  const [eligibleAppts, setEligibleAppts] = useState<EligibleReviewAppointment[]>([]);
+  const [reviewCheckMessage, setReviewCheckMessage] = useState('');
+  const [selectedReviewApptId, setSelectedReviewApptId] = useState('');
+  const [reviewRating, setReviewRating] = useState(5);
+  const [reviewComment, setReviewComment] = useState('');
+  const [reviewSubmitting, setReviewSubmitting] = useState(false);
 
   const loadStorefront = useCallback(async () => {
     if (!slug) return;
     setLoading(true);
     try {
-      const [pubRes, meRes] = await Promise.all([
-        fetch(`/api/public/booking/${encodeURIComponent(slug)}`, { cache: 'no-store' }),
-        fetch('/api/auth/me', { cache: 'no-store' }),
-      ]);
+      const pubRes = await fetch(`/api/public/booking/${encodeURIComponent(slug)}`, {
+        cache: 'no-store',
+      });
       if (!pubRes.ok) {
         setNotFoundErr(true);
         return;
       }
       const pubJson = (await pubRes.json()) as PublicBookingPayload;
       setPayload(pubJson);
-
-      if (meRes.ok) {
-        const meJson = await meRes.json();
-        setCustomerAcc(meJson.user?.customerAccount ?? null);
-      }
     } finally {
       setLoading(false);
     }
@@ -126,7 +131,7 @@ export default function PublicBookingStorefrontPage() {
     };
   }, [loadStorefront]);
 
-  // Tarih/Hizmet/Personel değiştikçe uygun saatleri getir
+  // Tarih/Hizmet/Personel değiştikçe 30 dk Yeşil/Kırmızı slot matrisini getir
   useEffect(() => {
     if (!wizardOpen || step !== 3 || !selectedServiceId || !selectedDate || !slug) return;
     let active = true;
@@ -138,7 +143,19 @@ export default function PublicBookingStorefrontPage() {
         );
         const json = await res.json();
         if (active && res.ok) {
-          setSlots(json.slots ?? []);
+          if (Array.isArray(json.slotMatrix)) {
+            setSlotMatrix(json.slotMatrix);
+          } else {
+            const fallback = ((json.slots ?? []) as Array<{ time: string; availableStaffIds: string[] }>).map(
+              (s) => ({
+                time: s.time,
+                available: true,
+                reason: 'available' as const,
+                availableStaffIds: s.availableStaffIds ?? [],
+              })
+            );
+            setSlotMatrix(fallback);
+          }
         }
       } finally {
         if (active) setLoadingSlots(false);
@@ -182,87 +199,36 @@ export default function PublicBookingStorefrontPage() {
     setWizardOpen(true);
   }
 
-  async function handleCustomerLogin(e: React.FormEvent) {
-    e.preventDefault();
-    const supabase = createBrowserSupabase();
-    if (!supabase) return;
-    setAuthBusy(true);
-    try {
-      const { error } = await supabase.auth.signInWithPassword({
-        email: loginForm.email.trim().toLowerCase(),
-        password: loginForm.password,
-      });
-      if (error) {
-        showToast('E-posta veya şifre hatalı', 'error');
-        return;
-      }
-      const meRes = await fetch('/api/auth/me', { cache: 'no-store' });
-      const meJson = await meRes.json();
-      if (!meJson.user?.customerAccount) {
-        showToast(
-          'Bu hesap müşteri hesabı değil. Lütfen müşteri hesabıyla giriş yapın veya kayıt olun.',
-          'error'
-        );
-        return;
-      }
-      setCustomerAcc(meJson.user.customerAccount);
-      showToast('Müşteri oturumu açıldı', 'success');
-    } finally {
-      setAuthBusy(false);
-    }
+  function openReviewModal() {
+    setReviewPhone(phone || '');
+    setReviewCheckDone(false);
+    setEligibleAppts([]);
+    setReviewCheckMessage('');
+    setSelectedReviewApptId('');
+    setReviewRating(5);
+    setReviewComment('');
+    setReviewModalOpen(true);
   }
 
-  async function handleCustomerRegister(e: React.FormEvent) {
+  async function handleConfirmBooking(e: React.FormEvent) {
     e.preventDefault();
-    const supabase = createBrowserSupabase();
-    if (!supabase) return;
-    setAuthBusy(true);
-    try {
-      const res = await fetch('/api/customer/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(registerForm),
-      });
-      const json = await res.json();
-      if (!res.ok) {
-        showToast(json.error || 'Kayıt tamamlanamadı', 'error');
-        return;
-      }
-      const { error: signErr } = await supabase.auth.signInWithPassword({
-        email: registerForm.email.trim().toLowerCase(),
-        password: registerForm.password,
-      });
-      if (signErr) {
-        showToast('Hesap oluşturuldu, lütfen giriş sekmesinden oturum açın', 'info');
-        setAuthTab('login');
-        return;
-      }
-      const meRes = await fetch('/api/auth/me', { cache: 'no-store' });
-      const meJson = await meRes.json();
-      setCustomerAcc(meJson.user?.customerAccount ?? null);
-      showToast('Müşteri hesabınız oluşturuldu', 'success');
-    } finally {
-      setAuthBusy(false);
-    }
-  }
-
-  async function handleConfirmBooking() {
-    if (!customerAcc) {
-      showToast('Randevuyu onaylamak için müşteri hesabınıza giriş yapmalısınız', 'error');
+    if (!fullName.trim() || !phone.trim()) {
+      showToast('Lütfen ad soyad ve cep telefonu numaranızı giriniz.', 'error');
       return;
     }
     setSubmitting(true);
     try {
-      const res = await fetch('/api/customer/appointments', {
+      const res = await fetch(`/api/public/booking/${encodeURIComponent(slug)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          slug,
+          fullName: fullName.trim(),
+          phone: phone.trim(),
           serviceId: selectedServiceId,
           staffId: selectedStaffId,
           appointmentDate: selectedDate,
           startTime: selectedTime,
-          customerNotes,
+          customerNotes: customerNotes.trim(),
         }),
       });
       const json = await res.json();
@@ -272,9 +238,76 @@ export default function PublicBookingStorefrontPage() {
       }
       setConfirmedAppt(json.appointment);
       setStep(5);
-      showToast('Randevunuz oluşturuldu!', 'success');
+      showToast('Randevunuz başarıyla oluşturuldu!', 'success');
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function handleVerifyPhoneForReview(e: React.FormEvent) {
+    e.preventDefault();
+    if (!reviewPhone.trim()) return;
+    setReviewChecking(true);
+    setReviewCheckMessage('');
+    try {
+      const res = await fetch(
+        `/api/public/booking/${encodeURIComponent(slug)}/reviews?phone=${encodeURIComponent(
+          reviewPhone.trim()
+        )}`,
+        { cache: 'no-store' }
+      );
+      const json = await res.json();
+      setReviewCheckDone(true);
+      if (!res.ok) {
+        setEligibleAppts([]);
+        setReviewCheckMessage(json.error || 'Telefon doğrulanamadı.');
+        return;
+      }
+      const list = (json.eligibleAppointments ?? []) as EligibleReviewAppointment[];
+      setEligibleAppts(list);
+      if (list.length > 0) {
+        setSelectedReviewApptId(list[0].id);
+      } else if (!json.hasAnyAppointment) {
+        setReviewCheckMessage(
+          'Bu telefon numarası ile işletmemizde tamamlanmış bir randevu kaydı bulunamadı.'
+        );
+      } else if (json.latestAppointmentStatus === 'completed') {
+        setReviewCheckMessage('Tamamlanmış randevularınız için zaten değerlendirme yaptınız.');
+      } else {
+        setReviewCheckMessage(
+          'Randevunuz işletme tarafından "Tamamlandı" olarak işaretlendikten sonra puanlama ve yorum yapabilirsiniz.'
+        );
+      }
+    } finally {
+      setReviewChecking(false);
+    }
+  }
+
+  async function handleSubmitReview(e: React.FormEvent) {
+    e.preventDefault();
+    if (!selectedReviewApptId || !reviewComment.trim()) return;
+    setReviewSubmitting(true);
+    try {
+      const res = await fetch(`/api/public/booking/${encodeURIComponent(slug)}/reviews`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          phone: reviewPhone.trim(),
+          appointmentId: selectedReviewApptId,
+          rating: reviewRating,
+          comment: reviewComment.trim(),
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        showToast(json.error || 'Değerlendirme gönderilemedi', 'error');
+        return;
+      }
+      showToast('Değerlendirmeniz yayınlandı, teşekkür ederiz!', 'success');
+      setReviewModalOpen(false);
+      await loadStorefront();
+    } finally {
+      setReviewSubmitting(false);
     }
   }
 
@@ -317,12 +350,14 @@ export default function PublicBookingStorefrontPage() {
         services={payload.services}
         staff={payload.staff}
         reviews={payload.reviews}
+        ratingSummary={payload.ratingSummary}
         isBookingOpen={payload.isBookingOpen}
         closedReason={payload.closedReason}
         onStartBooking={openBookingWizard}
+        onOpenReviewModal={openReviewModal}
       />
 
-      {/* Adım Adım Randevu Alma Sihirbazı */}
+      {/* Adım Adım Telefon ile Hızlı Randevu Sihirbazı */}
       {wizardOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-[1px]">
           <div className="flex max-h-[92vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
@@ -342,7 +377,7 @@ export default function PublicBookingStorefrontPage() {
                     {step === 1 && '1. Adım: Hizmet Seçin'}
                     {step === 2 && '2. Adım: Personel Seçin'}
                     {step === 3 && '3. Adım: Tarih ve Saat Seçin'}
-                    {step === 4 && '4. Adım: Doğrulama ve Onay'}
+                    {step === 4 && '4. Adım: İletişim Bilgileri ve Onay'}
                     {step === 5 && 'Randevunuz Alındı'}
                   </h2>
                   <p className="text-[11px] text-slate-500">{payload.page.page_title}</p>
@@ -458,7 +493,7 @@ export default function PublicBookingStorefrontPage() {
                 </div>
               )}
 
-              {/* ADIM 3: TARİH & SAAT */}
+              {/* ADIM 3: 30 DK YEŞİL / KIRMIZI SAAT KUTUCUKLARI */}
               {step === 3 && (
                 <div className="space-y-4">
                   <div>
@@ -479,49 +514,89 @@ export default function PublicBookingStorefrontPage() {
                   </div>
 
                   <div>
-                    <div className="mb-2 flex items-center gap-1.5 font-semibold text-slate-700">
-                      <Clock className="h-3.5 w-3.5 text-[#0F2942]" />
-                      <span>Müsait Saat Dilimleri ({formatDateTR(selectedDate)})</span>
+                    <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 font-semibold text-slate-700">
+                        <Clock className="h-3.5 w-3.5 text-[#0F2942]" />
+                        <span>Saat Seçimi ({formatDateTR(selectedDate)})</span>
+                      </div>
+
+                      <div className="flex items-center gap-3 text-[11px] font-medium">
+                        <span className="inline-flex items-center gap-1 text-emerald-700">
+                          <span className="h-2.5 w-2.5 rounded-xs bg-emerald-500" />
+                          Müsait
+                        </span>
+                        <span className="inline-flex items-center gap-1 text-red-700">
+                          <span className="h-2.5 w-2.5 rounded-xs bg-red-500" />
+                          Dolu / Kapalı
+                        </span>
+                      </div>
                     </div>
 
                     {loadingSlots ? (
-                      <div className="grid grid-cols-4 gap-2">
+                      <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
                         {[1, 2, 3, 4, 5, 6, 7, 8].map((i) => (
-                          <div key={i} className="h-9 rounded-lg bg-slate-100 animate-pulse" />
+                          <div key={i} className="h-12 rounded-lg bg-slate-100 animate-pulse" />
                         ))}
                       </div>
-                    ) : slots.length === 0 ? (
+                    ) : slotMatrix.length === 0 ? (
                       <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-center text-amber-900">
-                        Seçilen tarihte uygun randevu saati bulunmamaktadır. Lütfen başka bir tarih veya personel seçiniz.
+                        Seçilen tarihte işletme kapalı veya uygun çalışma saati tanımlanmamış. Lütfen başka bir tarih seçiniz.
                       </div>
                     ) : (
-                      <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                        {slots.map((sl) => (
-                          <button
-                            key={sl.time}
-                            type="button"
-                            onClick={() => {
-                              setSelectedTime(sl.time);
-                              setStep(4);
-                            }}
-                            className={`rounded-lg border py-2 font-mono text-xs font-semibold transition-colors ${
-                              selectedTime === sl.time
-                                ? 'border-[#0F2942] bg-[#0F2942] text-white'
-                                : 'border-slate-200 bg-white text-slate-800 hover:border-[#0F2942]'
-                            }`}
-                          >
-                            {sl.time}
-                          </button>
-                        ))}
+                      <div className="grid grid-cols-3 gap-2.5 sm:grid-cols-4">
+                        {slotMatrix.map((sl) => {
+                          const isSelected = selectedTime === sl.time && sl.available;
+                          const unavailableLabel =
+                            sl.reason === 'past'
+                              ? 'Geçti'
+                              : sl.reason === 'break'
+                              ? 'Mola'
+                              : sl.reason === 'off'
+                              ? 'Kapalı'
+                              : 'Dolu';
+
+                          return (
+                            <button
+                              key={sl.time}
+                              type="button"
+                              disabled={!sl.available}
+                              onClick={() => {
+                                if (!sl.available) return;
+                                setSelectedTime(sl.time);
+                                setStep(4);
+                              }}
+                              className={`flex flex-col items-center justify-center rounded-xl border py-2.5 px-2 transition-all ${
+                                !sl.available
+                                  ? 'border-red-300 bg-red-50 text-red-700 cursor-not-allowed opacity-90'
+                                  : isSelected
+                                  ? 'border-emerald-700 bg-emerald-700 text-white shadow-sm'
+                                  : 'border-emerald-500 bg-emerald-50 text-emerald-900 hover:bg-emerald-100'
+                              }`}
+                            >
+                              <span className="font-mono text-sm font-bold">{sl.time}</span>
+                              <span
+                                className={`mt-0.5 text-[10px] font-semibold ${
+                                  !sl.available
+                                    ? 'text-red-600'
+                                    : isSelected
+                                    ? 'text-emerald-100'
+                                    : 'text-emerald-700'
+                                }`}
+                              >
+                                {sl.available ? 'Müsait' : unavailableLabel}
+                              </span>
+                            </button>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
                 </div>
               )}
 
-              {/* ADIM 4: MÜŞTERİ GİRİŞ/KAYIT VE ONAY */}
+              {/* ADIM 4: SADECE AD SOYAD + CEP TELEFONU + ONAY (HESAPSIZ) */}
               {step === 4 && selectedService && (
-                <div className="space-y-4">
+                <form onSubmit={handleConfirmBooking} className="space-y-4">
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-1.5">
                     <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
                       Randevu Özeti
@@ -543,175 +618,68 @@ export default function PublicBookingStorefrontPage() {
                     </p>
                   </div>
 
-                  {!customerAcc ? (
-                    <div className="rounded-xl border border-slate-200 p-4 space-y-4">
-                      <div className="flex items-center gap-2 text-slate-800">
-                        <Lock className="h-4 w-4 text-[#0F2942]" />
-                        <p className="font-semibold">
-                          Randevunuzu tamamlamak için müşteri hesabınızla devam edin
-                        </p>
-                      </div>
-
-                      <div className="grid grid-cols-2 rounded-lg border border-slate-200 bg-slate-50 p-1 font-semibold">
-                        <button
-                          type="button"
-                          onClick={() => setAuthTab('login')}
-                          className={`rounded-md py-1.5 ${
-                            authTab === 'login' ? 'bg-white text-[#0F2942] shadow-xs' : 'text-slate-500'
-                          }`}
-                        >
-                          Giriş Yap
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setAuthTab('register')}
-                          className={`rounded-md py-1.5 ${
-                            authTab === 'register' ? 'bg-white text-[#0F2942] shadow-xs' : 'text-slate-500'
-                          }`}
-                        >
-                          Hızlı Üye Ol
-                        </button>
-                      </div>
-
-                      {authTab === 'login' ? (
-                        <form onSubmit={handleCustomerLogin} className="space-y-2.5">
-                          <input
-                            type="email"
-                            required
-                            value={loginForm.email}
-                            onChange={(e) => setLoginForm({ ...loginForm, email: e.target.value })}
-                            placeholder="E-posta adresiniz"
-                            className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                          />
-                          <input
-                            type="password"
-                            required
-                            value={loginForm.password}
-                            onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                            placeholder="Şifreniz"
-                            className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                          />
-                          <button
-                            type="submit"
-                            disabled={authBusy}
-                            className="w-full rounded-lg bg-[#0F2942] py-2 font-semibold text-white hover:bg-[#173B5E] disabled:opacity-50"
-                          >
-                            {authBusy ? 'Giriş Yapılıyor...' : 'Giriş Yap ve Devam Et'}
-                          </button>
-                        </form>
-                      ) : (
-                        <form onSubmit={handleCustomerRegister} className="space-y-2.5">
-                          <div className="grid grid-cols-2 gap-2">
-                            <input
-                              type="text"
-                              required
-                              value={registerForm.firstName}
-                              onChange={(e) =>
-                                setRegisterForm({ ...registerForm, firstName: e.target.value })
-                              }
-                              placeholder="Ad *"
-                              className="rounded-lg border border-slate-300 px-3 py-2"
-                            />
-                            <input
-                              type="text"
-                              required
-                              value={registerForm.lastName}
-                              onChange={(e) =>
-                                setRegisterForm({ ...registerForm, lastName: e.target.value })
-                              }
-                              placeholder="Soyad *"
-                              className="rounded-lg border border-slate-300 px-3 py-2"
-                            />
-                          </div>
-                          <input
-                            type="tel"
-                            required
-                            value={registerForm.phone}
-                            onChange={(e) =>
-                              setRegisterForm({ ...registerForm, phone: e.target.value })
-                            }
-                            placeholder="Telefon numaranız *"
-                            className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                          />
-                          <input
-                            type="email"
-                            required
-                            value={registerForm.email}
-                            onChange={(e) =>
-                              setRegisterForm({ ...registerForm, email: e.target.value })
-                            }
-                            placeholder="E-posta adresiniz *"
-                            className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                          />
-                          <div className="grid grid-cols-2 gap-2">
-                            <input
-                              type="password"
-                              required
-                              minLength={6}
-                              value={registerForm.password}
-                              onChange={(e) =>
-                                setRegisterForm({ ...registerForm, password: e.target.value })
-                              }
-                              placeholder="Şifre (en az 6) *"
-                              className="rounded-lg border border-slate-300 px-3 py-2"
-                            />
-                            <input
-                              type="password"
-                              required
-                              minLength={6}
-                              value={registerForm.confirmPassword}
-                              onChange={(e) =>
-                                setRegisterForm({
-                                  ...registerForm,
-                                  confirmPassword: e.target.value,
-                                })
-                              }
-                              placeholder="Şifre Tekrar *"
-                              className="rounded-lg border border-slate-300 px-3 py-2"
-                            />
-                          </div>
-                          <button
-                            type="submit"
-                            disabled={authBusy}
-                            className="w-full rounded-lg bg-emerald-700 py-2 font-semibold text-white hover:bg-emerald-800 disabled:opacity-50"
-                          >
-                            {authBusy ? 'Hesap Oluşturuluyor...' : 'Ücretsiz Üye Ol ve Devam Et'}
-                          </button>
-                        </form>
-                      )}
+                  <div className="space-y-3 rounded-xl border border-slate-200 p-4">
+                    <div className="flex items-center gap-2 text-slate-900">
+                      <Phone className="h-4 w-4 text-emerald-700" />
+                      <p className="font-semibold">
+                        Randevuyu tamamlamak için iletişim bilgilerinizi girin
+                      </p>
                     </div>
-                  ) : (
-                    <div className="space-y-3">
-                      <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 text-emerald-950">
-                        Müşteri: <strong>{customerAcc.first_name} {customerAcc.last_name}</strong> ({customerAcc.phone})
-                      </div>
 
-                      <div>
-                        <label className="block font-medium text-slate-700 mb-1">
-                          İşletmeye Notunuz (Opsiyonel)
-                        </label>
-                        <textarea
-                          rows={2}
-                          value={customerNotes}
-                          onChange={(e) => setCustomerNotes(e.target.value)}
-                          placeholder="Varsa özel isteğinizi yazabilirsiniz..."
-                          className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                        />
-                      </div>
-
-                      <button
-                        type="button"
-                        disabled={submitting}
-                        onClick={handleConfirmBooking}
-                        style={{ backgroundColor: payload.page.primary_color }}
-                        className="flex w-full items-center justify-center gap-2 rounded-xl py-3 text-sm font-semibold text-white hover:opacity-95 disabled:opacity-50"
-                      >
-                        <CalendarCheck className="h-4 w-4" />
-                        <span>{submitting ? 'Randevu Oluşturuluyor...' : 'Randevuyu Onayla'}</span>
-                      </button>
+                    <div>
+                      <label className="block font-medium text-slate-700 mb-1">Ad Soyad *</label>
+                      <input
+                        type="text"
+                        required
+                        minLength={2}
+                        value={fullName}
+                        onChange={(e) => setFullName(e.target.value)}
+                        placeholder="Örn: Ahmet Yılmaz"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm"
+                      />
                     </div>
-                  )}
-                </div>
+
+                    <div>
+                      <label className="block font-medium text-slate-700 mb-1">
+                        Cep Telefonu Numaranız *
+                      </label>
+                      <input
+                        type="tel"
+                        required
+                        value={phone}
+                        onChange={(e) => setPhone(e.target.value)}
+                        placeholder="05XX XXX XX XX"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm font-mono"
+                      />
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        Kayıt veya şifre gerekmez. Randevu sorgulama ve işlem sonrası puanlama bu numara ile yapılır.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block font-medium text-slate-700 mb-1">
+                        İşletmeye Notunuz (Opsiyonel)
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={customerNotes}
+                        onChange={(e) => setCustomerNotes(e.target.value)}
+                        placeholder="Varsa özel isteğinizi yazabilirsiniz..."
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2"
+                      />
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    style={{ backgroundColor: payload.page.primary_color }}
+                    className="flex w-full items-center justify-center gap-2 rounded-xl py-3 text-sm font-semibold text-white hover:opacity-95 disabled:opacity-50"
+                  >
+                    <CalendarCheck className="h-4 w-4" />
+                    <span>{submitting ? 'Randevu Oluşturuluyor...' : 'Randevuyu Onayla'}</span>
+                  </button>
+                </form>
               )}
 
               {/* ADIM 5: BAŞARI */}
@@ -722,7 +690,7 @@ export default function PublicBookingStorefrontPage() {
                     <h3 className="text-lg font-bold text-slate-900">
                       {confirmedAppt.status === 'confirmed'
                         ? 'Randevunuz Onaylandı!'
-                        : 'Randevu Talebiniz Alındı!'}
+                        : 'Randevunuz Alındı!'}
                     </h3>
                     <p className="mt-1 text-slate-600">
                       {formatDateTR(confirmedAppt.appointment_date)} ·{' '}
@@ -732,10 +700,10 @@ export default function PublicBookingStorefrontPage() {
                   </div>
                   <div className="flex flex-wrap justify-center gap-2 pt-2">
                     <Link
-                      href="/musteri"
+                      href={`/musteri?phone=${encodeURIComponent(phone.trim())}`}
                       className="rounded-lg bg-[#0F2942] px-4 py-2.5 text-xs font-semibold text-white hover:bg-[#173B5E]"
                     >
-                      Randevularımı Görüntüle
+                      Telefon ile Randevumu Sorgula
                     </Link>
                     <button
                       type="button"
@@ -748,6 +716,134 @@ export default function PublicBookingStorefrontPage() {
                 </div>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Telefon Doğrulamalı Puanlama ve Yorum Modalı */}
+      {reviewModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-[1px]">
+          <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Hizmeti Değerlendirin</h3>
+                <p className="text-[11px] text-slate-500">
+                  Yalnızca randevusunu tamamlamış müşteriler puanlama yapabilir
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReviewModalOpen(false)}
+                className="rounded-lg p-1 text-slate-400 hover:bg-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleVerifyPhoneForReview} className="mt-4 space-y-3 text-xs">
+              <label className="block font-medium text-slate-700">
+                Randevu Aldığınız Cep Telefonu *
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type="tel"
+                  required
+                  value={reviewPhone}
+                  onChange={(e) => {
+                    setReviewPhone(e.target.value);
+                    setReviewCheckDone(false);
+                    setEligibleAppts([]);
+                    setReviewCheckMessage('');
+                  }}
+                  placeholder="05XX XXX XX XX"
+                  className="flex-1 rounded-lg border border-slate-300 px-3 py-2 font-mono text-sm"
+                />
+                <button
+                  type="submit"
+                  disabled={reviewChecking}
+                  className="rounded-lg bg-[#0F2942] px-4 py-2 font-semibold text-white hover:bg-[#173B5E] disabled:opacity-50"
+                >
+                  {reviewChecking ? 'Kontrol...' : 'Doğrula'}
+                </button>
+              </div>
+            </form>
+
+            {reviewCheckDone && reviewCheckMessage && (
+              <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-xs text-amber-950">
+                {reviewCheckMessage}
+              </div>
+            )}
+
+            {eligibleAppts.length > 0 && (
+              <form onSubmit={handleSubmitReview} className="mt-4 space-y-4 border-t border-slate-200 pt-4 text-xs">
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">
+                    Değerlendirilecek Tamamlanmış Randevu
+                  </label>
+                  <select
+                    value={selectedReviewApptId}
+                    onChange={(e) => setSelectedReviewApptId(e.target.value)}
+                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2"
+                  >
+                    {eligibleAppts.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {formatDateTR(a.appointment_date)} {a.start_time} · {a.service_name_snapshot} ({a.staff_name_snapshot})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1.5">Puanınız</label>
+                  <div className="flex items-center gap-1.5">
+                    {[1, 2, 3, 4, 5].map((s) => (
+                      <button
+                        key={s}
+                        type="button"
+                        onClick={() => setReviewRating(s)}
+                        className="p-1"
+                      >
+                        <Star
+                          className={`h-7 w-7 ${
+                            s <= reviewRating ? 'fill-amber-400 text-amber-400' : 'text-slate-300'
+                          }`}
+                        />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Yorumunuz *</label>
+                  <textarea
+                    rows={3}
+                    required
+                    minLength={3}
+                    value={reviewComment}
+                    onChange={(e) => setReviewComment(e.target.value)}
+                    placeholder="Hizmet deneyiminizi paylaşın..."
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2"
+                  />
+                </div>
+
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setReviewModalOpen(false)}
+                    className="rounded-lg border border-slate-200 px-4 py-2 font-medium text-slate-700"
+                  >
+                    İptal
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={reviewSubmitting}
+                    className="rounded-lg bg-emerald-700 px-4 py-2 font-semibold text-white hover:bg-emerald-800 disabled:opacity-50"
+                  >
+                    {reviewSubmitting ? 'Gönderiliyor...' : 'Yorumu Yayınla'}
+                  </button>
+                </div>
+              </form>
+            )}
           </div>
         </div>
       )}

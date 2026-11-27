@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { createBrowserSupabase } from '@/lib/supabase/client';
 import { formatCurrencyTRY, formatDateTimeTR, formatDateTR } from '@/lib/format';
 import { getSubscriptionStatusDisplay, StatusText } from '@/components/ui/StatusText';
 import { useToast } from '@/components/ToastProvider';
@@ -95,13 +94,20 @@ export default function BusinessSettingsPage() {
       showToast('Şifreler eşleşmiyor.', 'error');
       return;
     }
-    const supabase = createBrowserSupabase();
-    if (!supabase) return;
     setPwSaving(true);
     try {
-      const { error } = await supabase.auth.updateUser({ password: newPassword });
-      if (error) {
-        showToast(error.message, 'error');
+      const res = await fetch('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'change_self',
+          password: newPassword,
+          confirmPassword,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showToast(data.error || 'Şifre güncellenemedi', 'error');
         return;
       }
       showToast('Şifreniz güncellendi', 'success');

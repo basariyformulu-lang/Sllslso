@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server';
 import { getAuthContext } from '@/lib/auth-server';
-import { createServiceRoleSupabase, isServiceRoleConfigured, isSupabaseConfigured } from '@/lib/supabase/server';
+import { isDatabaseConfigured, queryOne } from '@/lib/db';
 
 export async function GET() {
-  if (!isSupabaseConfigured() || !isServiceRoleConfigured()) {
+  if (!isDatabaseConfigured()) {
     return NextResponse.json({ configured: false, user: null });
   }
 
@@ -12,16 +12,13 @@ export async function GET() {
     return NextResponse.json({ configured: true, user: null });
   }
 
-  const db = createServiceRoleSupabase()!;
   let unreadNotifications = 0;
-
   if (ctx.business) {
-    const { count } = await db
-      .from('notifications')
-      .select('id', { count: 'exact', head: true })
-      .eq('business_id', ctx.business.id)
-      .eq('is_read', false);
-    unreadNotifications = count ?? 0;
+    const row = await queryOne<{ c: number }>(
+      'SELECT COUNT(*) AS c FROM notifications WHERE business_id = ? AND is_read = 0',
+      [ctx.business.id]
+    );
+    unreadNotifications = Number(row?.c ?? 0);
   }
 
   return NextResponse.json({
@@ -34,7 +31,6 @@ export async function GET() {
       member: ctx.member,
       business: ctx.business,
       isSubscriptionActive: ctx.isSubscriptionActive,
-      customerAccount: ctx.customerAccount,
       unreadNotifications,
     },
   });
